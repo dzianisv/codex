@@ -135,6 +135,7 @@ pub use rollout::policy::EventPersistenceMode;
 pub use rollout::rollout_date_parts;
 pub use rollout::session_index::find_thread_names_by_ids;
 mod function_tool;
+pub mod reflection;
 mod state;
 mod tasks;
 mod user_shell_command;
