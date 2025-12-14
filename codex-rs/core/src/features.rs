@@ -172,6 +172,8 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Enable Responses API websocket v2 mode.
     ResponsesWebsocketsV2,
+    /// Reflection layer that verifies task completion via a judge model.
+    Reflection,
 }
 
 impl Feature {
@@ -548,6 +550,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::Reflection,
+        key: "reflection",
+        stage: Stage::Experimental {
+            name: "Reflection",
+            menu_description: "Run a reflection judge pass before Codex finalizes a response.",
+            announcement: "NEW: Reflection is now available in /experimental. Enable it to try judge-based completion checks.",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::Sqlite,
         key: "sqlite",
         stage: Stage::Removed,
@@ -874,6 +886,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn feature_specs_have_unique_ids_and_keys() {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut keys = std::collections::BTreeSet::new();
+
+        for spec in FEATURES {
+            assert!(ids.insert(spec.id), "duplicate feature id: {:?}", spec.id);
+            assert!(keys.insert(spec.key), "duplicate feature key: {}", spec.key);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn use_linux_sandbox_bwrap_is_experimental_on_linux() {
@@ -944,6 +967,20 @@ mod tests {
             Stage::UnderDevelopment
         );
         assert_eq!(Feature::RequestPermissionsTool.default_enabled(), false);
+    }
+
+    #[test]
+    fn reflection_is_experimental_and_user_toggleable() {
+        let spec = Feature::Reflection.info();
+        let stage = spec.stage;
+
+        assert!(matches!(stage, Stage::Experimental { .. }));
+        assert_eq!(stage.experimental_menu_name(), Some("Reflection"));
+        assert_eq!(
+            stage.experimental_menu_description(),
+            Some("Run a reflection judge pass before Codex finalizes a response.")
+        );
+        assert_eq!(Feature::Reflection.default_enabled(), false);
     }
 
     #[test]

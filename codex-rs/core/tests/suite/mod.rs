@@ -71,6 +71,7 @@ mod compact;
 mod compact_remote;
 mod compact_resume_fork;
 mod deprecation_notice;
+mod eval_swe_bench;
 mod exec;
 mod exec_policy;
 mod fork_thread;
@@ -100,6 +101,7 @@ mod prompt_caching;
 mod quota_exceeded;
 mod read_file;
 mod realtime_conversation;
+mod reflection;
 mod remote_models;
 mod request_compression;
 #[cfg(not(target_os = "windows"))]

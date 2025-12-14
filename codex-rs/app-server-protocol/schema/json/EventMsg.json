@@ -2957,6 +2957,60 @@
           "type": "object"
         },
         {
+          "description": "Reflection layer verdict after evaluating task completion.",
+          "properties": {
+            "attempt": {
+              "description": "Current reflection attempt number.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "completed": {
+              "description": "Whether the task was completed successfully.",
+              "type": "boolean"
+            },
+            "confidence": {
+              "description": "Confidence score from 0.0 to 1.0.",
+              "format": "float",
+              "type": "number"
+            },
+            "feedback": {
+              "description": "Feedback for incomplete tasks (None if completed).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_attempts": {
+              "description": "Maximum allowed attempts.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "reasoning": {
+              "description": "The judge's reasoning for the verdict.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "reflection_verdict"
+              ],
+              "title": "ReflectionVerdictEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "completed",
+            "confidence",
+            "max_attempts",
+            "reasoning",
+            "type"
+          ],
+          "title": "ReflectionVerdictEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Collab interaction: agent spawn begin.",
           "properties": {
             "call_id": {
@@ -8824,6 +8878,60 @@
         "type"
       ],
       "title": "ReasoningRawContentDeltaEventMsg",
+      "type": "object"
+    },
+    {
+      "description": "Reflection layer verdict after evaluating task completion.",
+      "properties": {
+        "attempt": {
+          "description": "Current reflection attempt number.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "completed": {
+          "description": "Whether the task was completed successfully.",
+          "type": "boolean"
+        },
+        "confidence": {
+          "description": "Confidence score from 0.0 to 1.0.",
+          "format": "float",
+          "type": "number"
+        },
+        "feedback": {
+          "description": "Feedback for incomplete tasks (None if completed).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_attempts": {
+          "description": "Maximum allowed attempts.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reasoning": {
+          "description": "The judge's reasoning for the verdict.",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "reflection_verdict"
+          ],
+          "title": "ReflectionVerdictEventMsgType",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt",
+        "completed",
+        "confidence",
+        "max_attempts",
+        "reasoning",
+        "type"
+      ],
+      "title": "ReflectionVerdictEventMsg",
       "type": "object"
     },
     {
