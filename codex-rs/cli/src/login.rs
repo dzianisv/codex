@@ -9,12 +9,25 @@ use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_login::ServerOptions;
 use codex_login::run_device_code_login;
+use codex_login::run_github_copilot_login;
 use codex_login::run_login_server;
 use codex_protocol::config_types::ForcedLoginMethod;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
 
+const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
+    "ChatGPT login is disabled. Use API key login instead.";
+const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
+    "API key login is disabled. Use ChatGPT login instead.";
+const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
+
+fn print_login_server_start(actual_port: u16, auth_url: &str) {
+    eprintln!(
+        "Starting local login server on http://localhost:{actual_port}.\nIf your browser did not open, navigate to this URL to authenticate:\n\n{auth_url}\n\nOn a remote or headless machine? Use `codex login --device-auth` instead."
+    );
+}
 pub async fn login_with_chatgpt(
     codex_home: PathBuf,
     forced_chatgpt_workspace_id: Option<String>,
@@ -27,11 +40,7 @@ pub async fn login_with_chatgpt(
         cli_auth_credentials_store_mode,
     );
     let server = run_login_server(opts)?;
-
-    eprintln!(
-        "Starting local login server on http://localhost:{}.\nIf your browser did not open, navigate to this URL to authenticate:\n\n{}",
-        server.actual_port, server.auth_url,
-    );
+    print_login_server_start(server.actual_port, &server.auth_url);
 
     server.block_until_done().await
 }
@@ -40,7 +49,7 @@ pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) ->
     let config = load_config_or_exit(cli_config_overrides).await;
 
     if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
-        eprintln!("ChatGPT login is disabled. Use API key login instead.");
+        eprintln!("{CHATGPT_LOGIN_DISABLED_MESSAGE}");
         std::process::exit(1);
     }
 
@@ -54,7 +63,7 @@ pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) ->
     .await
     {
         Ok(_) => {
-            eprintln!("Successfully logged in");
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
             std::process::exit(0);
         }
         Err(e) => {
@@ -71,7 +80,7 @@ pub async fn run_login_with_api_key(
     let config = load_config_or_exit(cli_config_overrides).await;
 
     if matches!(config.forced_login_method, Some(ForcedLoginMethod::Chatgpt)) {
-        eprintln!("API key login is disabled. Use ChatGPT login instead.");
+        eprintln!("{API_KEY_LOGIN_DISABLED_MESSAGE}");
         std::process::exit(1);
     }
 
@@ -81,7 +90,7 @@ pub async fn run_login_with_api_key(
         config.cli_auth_credentials_store_mode,
     ) {
         Ok(_) => {
-            eprintln!("Successfully logged in");
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
             std::process::exit(0);
         }
         Err(e) => {
@@ -126,7 +135,7 @@ pub async fn run_login_with_device_code(
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
     if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
-        eprintln!("ChatGPT login is disabled. Use API key login instead.");
+        eprintln!("{CHATGPT_LOGIN_DISABLED_MESSAGE}");
         std::process::exit(1);
     }
     let forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
@@ -141,7 +150,7 @@ pub async fn run_login_with_device_code(
     }
     match run_device_code_login(opts).await {
         Ok(()) => {
-            eprintln!("Successfully logged in");
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
             std::process::exit(0);
         }
         Err(e) => {
@@ -151,6 +160,41 @@ pub async fn run_login_with_device_code(
     }
 }
 
+/// Login using GitHub Copilot OAuth device code flow.
+pub async fn run_login_with_github_copilot(cli_config_overrides: CliConfigOverrides) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+
+    if matches!(config.forced_login_method, Some(ForcedLoginMethod::Chatgpt)) {
+        eprintln!("{API_KEY_LOGIN_DISABLED_MESSAGE}");
+        std::process::exit(1);
+    }
+
+    let copilot_token = match run_github_copilot_login().await {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("Error logging in with GitHub Copilot: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match login_with_api_key(
+        &config.codex_home,
+        &copilot_token,
+        config.cli_auth_credentials_store_mode,
+    ) {
+        Ok(_) => {
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
+            eprintln!(
+                "To use GitHub Copilot, set `model_provider = \"{GITHUB_COPILOT_PROVIDER_ID}\"`."
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Error saving GitHub Copilot credentials: {e}");
+            std::process::exit(1);
+        }
+    }
+}
 pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
 

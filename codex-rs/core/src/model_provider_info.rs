@@ -29,6 +29,13 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 pub const CHAT_WIRE_API_DEPRECATION_SUMMARY: &str = r#"Support for the "chat" wire API is deprecated and will soon be removed. Update your model provider definition in config.toml to use wire_api = "responses"."#;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+const GITHUB_COPILOT_PROVIDER_NAME: &str = "GitHub Copilot";
+const GITHUB_COPILOT_TOKEN_ENV_KEY: &str = "GITHUB_COPILOT_TOKEN";
+const GITHUB_COPILOT_TOKEN_INSTRUCTIONS: &str =
+    "Set GITHUB_COPILOT_TOKEN to a valid GitHub Copilot bearer token before starting Codex.";
+const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+pub(crate) const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
+pub(crate) const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
 /// Wire protocol that the provider speaks. Most third-party services only
 /// implement the classic OpenAI Chat Completions JSON schema, whereas OpenAI
@@ -253,10 +260,36 @@ impl ModelProviderInfo {
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
+
+    pub fn create_github_copilot_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: GITHUB_COPILOT_PROVIDER_NAME.into(),
+            base_url: Some("https://api.githubcopilot.com".into()),
+            env_key: Some(GITHUB_COPILOT_TOKEN_ENV_KEY.into()),
+            env_key_instructions: Some(GITHUB_COPILOT_TOKEN_INSTRUCTIONS.into()),
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: Some(
+                [(
+                    "Openai-Intent".to_string(),
+                    "conversation-edits".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+        }
+    }
 }
 
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
 pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
+pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
@@ -265,12 +298,15 @@ pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
 pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
     use ModelProviderInfo as P;
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // Keep the built-in set intentionally small (OpenAI, GitHub Copilot, and
+    // OSS locals). Users can add any other providers via `model_providers` in
+    // config.toml.
     [
         ("openai", P::create_openai_provider()),
+        (
+            GITHUB_COPILOT_PROVIDER_ID,
+            P::create_github_copilot_provider(),
+        ),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Chat),
@@ -495,5 +531,37 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 "expected {base_url} not to be detected as Azure"
             );
         }
+    }
+
+    #[test]
+    fn test_built_in_model_providers_include_github_copilot() {
+        let providers = built_in_model_providers();
+        let copilot = providers
+            .get(GITHUB_COPILOT_PROVIDER_ID)
+            .expect("github-copilot provider should exist");
+
+        assert_eq!(copilot.name, GITHUB_COPILOT_PROVIDER_NAME);
+        assert_eq!(
+            copilot.base_url.as_deref(),
+            Some("https://api.githubcopilot.com")
+        );
+        assert_eq!(
+            copilot.env_key.as_deref(),
+            Some(GITHUB_COPILOT_TOKEN_ENV_KEY)
+        );
+        assert_eq!(
+            copilot.env_key_instructions.as_deref(),
+            Some(GITHUB_COPILOT_TOKEN_INSTRUCTIONS)
+        );
+        assert_eq!(copilot.requires_openai_auth, false);
+        assert_eq!(copilot.wire_api, WireApi::Responses);
+        assert_eq!(
+            copilot
+                .http_headers
+                .as_ref()
+                .and_then(|headers| headers.get("Openai-Intent"))
+                .map(String::as_str),
+            Some("conversation-edits")
+        );
     }
 }

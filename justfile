@@ -48,6 +48,10 @@ install:
 test:
     cargo nextest run --no-fail-fast
 
+# Run GitHub Copilot auth-flow tests (mocked) and, by default, a live gpt-4.1
+# API check. Use `just test-github-copilot --no-live` for local offline checks.
+test-github-copilot *args:
+    ../scripts/test_github_copilot_gpt41.sh "$@"
 # Run the MCP server
 mcp-server-run *args:
     cargo run -p codex-mcp-server -- "$@"
