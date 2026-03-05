@@ -33,9 +33,6 @@ const GITHUB_COPILOT_PROVIDER_NAME: &str = "GitHub Copilot";
 const GITHUB_COPILOT_TOKEN_ENV_KEY: &str = "GITHUB_COPILOT_TOKEN";
 const GITHUB_COPILOT_TOKEN_INSTRUCTIONS: &str =
     "Set GITHUB_COPILOT_TOKEN to a valid GitHub Copilot bearer token before starting Codex.";
-const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
-pub(crate) const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
-pub(crate) const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
 /// Wire protocol that the provider speaks. Most third-party services only
 /// implement the classic OpenAI Chat Completions JSON schema, whereas OpenAI

@@ -817,28 +817,6 @@ mod tests {
         )
     }
 
-    fn finalize_fork_from_args(args: &[&str]) -> TuiCli {
-        let cli = MultitoolCli::try_parse_from(args).expect("parse");
-        let MultitoolCli {
-            interactive,
-            config_overrides: root_overrides,
-            subcommand,
-            feature_toggles: _,
-        } = cli;
-
-        let Subcommand::Fork(ForkCommand {
-            session_id,
-            last,
-            all,
-            config_overrides: fork_cli,
-        }) = subcommand.expect("fork present")
-        else {
-            unreachable!()
-        };
-
-        finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
-    }
-
     #[test]
     fn exec_resume_last_accepts_prompt_positional() {
         let cli =
