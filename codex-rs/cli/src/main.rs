@@ -31,6 +31,7 @@ use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use supports_color::Stream;
@@ -53,13 +54,15 @@ use codex_core::features::Stage;
 use codex_core::features::is_known_feature_key;
 use codex_core::terminal::TerminalName;
 
+const CLI_VERSION: &str = env!("CODEX_CLI_VERSION");
+
 /// Codex CLI
 ///
 /// If no subcommand is specified, options will be forwarded to the interactive CLI.
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    version = CLI_VERSION,
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like
@@ -560,10 +563,29 @@ fn stage_str(stage: codex_core::features::Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    if should_print_version_only() {
+        println!("{CLI_VERSION}");
+        return Ok(());
+    }
+
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         cli_main(arg0_paths).await?;
         Ok(())
     })
+}
+
+fn should_print_version_only() -> bool {
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+
+    if args.next().is_some() {
+        return false;
+    }
+
+    flag == OsStr::new("--version") || flag == OsStr::new("-V")
 }
 
 async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
