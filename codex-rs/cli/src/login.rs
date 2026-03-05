@@ -1,4 +1,5 @@
 use codex_core::CodexAuth;
+use codex_core::GITHUB_COPILOT_PROVIDER_ID;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::AuthMode;
 use codex_core::auth::CLIENT_ID;
@@ -20,7 +21,6 @@ const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
     "API key login is disabled. Use ChatGPT login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
-const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 
 fn print_login_server_start(actual_port: u16, auth_url: &str) {
     eprintln!(
