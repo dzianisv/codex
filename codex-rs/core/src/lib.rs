@@ -52,6 +52,7 @@ mod user_instructions;
 pub use model_provider_info::CHAT_WIRE_API_DEPRECATION_SUMMARY;
 pub use model_provider_info::DEFAULT_LMSTUDIO_PORT;
 pub use model_provider_info::DEFAULT_OLLAMA_PORT;
+pub use model_provider_info::GITHUB_COPILOT_PROVIDER_ID;
 pub use model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 pub use model_provider_info::ModelProviderInfo;
 pub use model_provider_info::OLLAMA_OSS_PROVIDER_ID;
