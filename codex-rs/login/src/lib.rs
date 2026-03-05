@@ -1,4 +1,5 @@
 mod device_code_auth;
+mod github_copilot_device_auth;
 mod pkce;
 mod server;
 
@@ -6,6 +7,9 @@ pub use device_code_auth::DeviceCode;
 pub use device_code_auth::complete_device_code_login;
 pub use device_code_auth::request_device_code;
 pub use device_code_auth::run_device_code_login;
+pub use github_copilot_device_auth::GithubCopilotDeviceAuthOptions;
+pub use github_copilot_device_auth::run_github_copilot_login;
+pub use github_copilot_device_auth::run_github_copilot_login_with_options;
 pub use server::LoginServer;
 pub use server::ServerOptions;
 pub use server::ShutdownHandle;

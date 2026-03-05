@@ -46,6 +46,11 @@ install:
 test:
     cargo nextest run --no-fail-fast
 
+# Run GitHub Copilot auth-flow tests (mocked) and, by default, a live gpt-4.1
+# API check. Use `just test-github-copilot --no-live` for local offline checks.
+test-github-copilot *args:
+    ../scripts/test_github_copilot_gpt41.sh "$@"
+
 # Build and run Codex from source using Bazel.
 # Note we have to use the combination of `[no-cd]` and `--run_under="cd $PWD &&"`
 # to ensure that Bazel runs the command in the current working directory.

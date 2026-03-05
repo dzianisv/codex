@@ -42,6 +42,7 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::GITHUB_COPILOT_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -127,6 +128,16 @@ enum ThreadInteractiveRequest {
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+
+fn startup_models_refresh_strategy(config: &Config) -> RefreshStrategy {
+    if config.model_provider_id == GITHUB_COPILOT_PROVIDER_ID {
+        // Copilot-only models come from the provider `/models` endpoint and
+        // are not present in bundled `models.json`.
+        RefreshStrategy::OnlineIfUncached
+    } else {
+        RefreshStrategy::Offline
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -1702,14 +1713,16 @@ impl App {
                     .features
                     .enabled(codex_core::features::Feature::DefaultModeRequestUserInput),
             },
+            config.model_provider.clone(),
         ));
+        let startup_refresh_strategy = startup_models_refresh_strategy(&config);
         let mut model = thread_manager
             .get_models_manager()
-            .get_default_model(&config.model, RefreshStrategy::Offline)
+            .get_default_model(&config.model, startup_refresh_strategy)
             .await;
         let available_models = thread_manager
             .get_models_manager()
-            .list_models(RefreshStrategy::Offline)
+            .list_models(startup_refresh_strategy)
             .await;
         let exit_info = handle_model_migration_prompt_if_needed(
             tui,
@@ -3843,6 +3856,37 @@ mod tests {
         assert_eq!(
             normalized.additional_writable_roots,
             vec![base_cwd.join("rel")]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_model_refresh_is_offline_for_default_provider() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+
+        assert_eq!(
+            startup_models_refresh_strategy(&config),
+            RefreshStrategy::Offline
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_model_refresh_fetches_remote_for_github_copilot() -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.model_provider_id = GITHUB_COPILOT_PROVIDER_ID.to_string();
+
+        assert_eq!(
+            startup_models_refresh_strategy(&config),
+            RefreshStrategy::OnlineIfUncached
         );
         Ok(())
     }
