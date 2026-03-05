@@ -15,6 +15,7 @@ use codex_cli::login::run_login_status;
 use codex_cli::login::run_login_with_api_key;
 use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
+use codex_cli::login::run_login_with_github_copilot;
 use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_exec::Cli as ExecCli;
@@ -281,6 +282,14 @@ struct LoginCommand {
 
     #[arg(long = "device-auth")]
     use_device_code: bool,
+
+    #[arg(
+        long = "github-copilot",
+        visible_alias = "copilot",
+        help = "Use GitHub Copilot OAuth device code login and store the resulting token",
+        conflicts_with_all = ["with_api_key", "api_key", "use_device_code", "issuer_base_url", "client_id"]
+    )]
+    use_github_copilot: bool,
 
     /// EXPERIMENTAL: Use custom OAuth issuer base URL (advanced)
     /// Override the OAuth issuer base URL (advanced)
@@ -680,7 +689,9 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     run_login_status(login_cli.config_overrides).await;
                 }
                 None => {
-                    if login_cli.use_device_code {
+                    if login_cli.use_github_copilot {
+                        run_login_with_github_copilot(login_cli.config_overrides).await;
+                    } else if login_cli.use_device_code {
                         run_login_with_device_code(
                             login_cli.config_overrides,
                             login_cli.issuer_base_url,
@@ -1172,6 +1183,25 @@ mod tests {
         assert!(args.last);
         assert_eq!(args.session_id, None);
         assert_eq!(args.prompt.as_deref(), Some("2+2"));
+    }
+
+    #[test]
+    fn login_github_copilot_flag_parses() {
+        let cli = MultitoolCli::try_parse_from(["codex", "login", "--github-copilot"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Login(login)) = cli.subcommand else {
+            panic!("expected login subcommand");
+        };
+        assert!(login.use_github_copilot);
+        assert!(!login.use_device_code);
+        assert!(!login.with_api_key);
+    }
+
+    #[test]
+    fn login_github_copilot_conflicts_with_with_api_key() {
+        let result =
+            MultitoolCli::try_parse_from(["codex", "login", "--github-copilot", "--with-api-key"]);
+        assert!(result.is_err());
     }
 
     #[test]

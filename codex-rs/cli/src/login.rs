@@ -7,6 +7,7 @@ use codex_core::auth::logout;
 use codex_core::config::Config;
 use codex_login::ServerOptions;
 use codex_login::run_device_code_login;
+use codex_login::run_github_copilot_login;
 use codex_login::run_login_server;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_utils_cli::CliConfigOverrides;
@@ -19,6 +20,7 @@ const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
     "API key login is disabled. Use ChatGPT login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 
 fn print_login_server_start(actual_port: u16, auth_url: &str) {
     eprintln!(
@@ -154,6 +156,42 @@ pub async fn run_login_with_device_code(
         }
         Err(e) => {
             eprintln!("Error logging in with device code: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Login using GitHub Copilot OAuth device code flow.
+pub async fn run_login_with_github_copilot(cli_config_overrides: CliConfigOverrides) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+
+    if matches!(config.forced_login_method, Some(ForcedLoginMethod::Chatgpt)) {
+        eprintln!("{API_KEY_LOGIN_DISABLED_MESSAGE}");
+        std::process::exit(1);
+    }
+
+    let copilot_token = match run_github_copilot_login().await {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("Error logging in with GitHub Copilot: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match login_with_api_key(
+        &config.codex_home,
+        &copilot_token,
+        config.cli_auth_credentials_store_mode,
+    ) {
+        Ok(_) => {
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
+            eprintln!(
+                "To use GitHub Copilot, set `model_provider = \"{GITHUB_COPILOT_PROVIDER_ID}\"`."
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Error saving GitHub Copilot credentials: {e}");
             std::process::exit(1);
         }
     }
