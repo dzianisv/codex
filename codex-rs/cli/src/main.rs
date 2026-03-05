@@ -14,6 +14,7 @@ use codex_cli::login::run_login_status;
 use codex_cli::login::run_login_with_api_key;
 use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
+use codex_cli::login::run_login_with_github_copilot;
 use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_common::CliConfigOverrides;
@@ -212,6 +213,14 @@ struct LoginCommand {
 
     #[arg(long = "device-auth")]
     use_device_code: bool,
+
+    #[arg(
+        long = "github-copilot",
+        visible_alias = "copilot",
+        help = "Use GitHub Copilot OAuth device code login and store the resulting token",
+        conflicts_with_all = ["with_api_key", "api_key", "use_device_code", "issuer_base_url", "client_id"]
+    )]
+    use_github_copilot: bool,
 
     /// EXPERIMENTAL: Use custom OAuth issuer base URL (advanced)
     /// Override the OAuth issuer base URL (advanced)
@@ -518,7 +527,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     run_login_status(login_cli.config_overrides).await;
                 }
                 None => {
-                    if login_cli.use_device_code {
+                    if login_cli.use_github_copilot {
+                        run_login_with_github_copilot(login_cli.config_overrides).await;
+                    } else if login_cli.use_device_code {
                         run_login_with_device_code(
                             login_cli.config_overrides,
                             login_cli.issuer_base_url,
@@ -804,6 +815,79 @@ mod tests {
             all,
             resume_cli,
         )
+    }
+
+    #[test]
+    fn exec_resume_last_accepts_prompt_positional() {
+        let cli =
+            MultitoolCli::try_parse_from(["codex", "exec", "--json", "resume", "--last", "2+2"])
+                .expect("parse should succeed");
+
+        let Some(Subcommand::Exec(exec)) = cli.subcommand else {
+            panic!("expected exec subcommand");
+        };
+        let Some(codex_exec::Command::Resume(args)) = exec.command else {
+            panic!("expected exec resume");
+        };
+
+        assert!(args.last);
+        assert_eq!(args.session_id, None);
+        assert_eq!(args.prompt.as_deref(), Some("2+2"));
+    }
+
+    #[test]
+    fn login_github_copilot_flag_parses() {
+        let cli = MultitoolCli::try_parse_from(["codex", "login", "--github-copilot"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Login(login)) = cli.subcommand else {
+            panic!("expected login subcommand");
+        };
+        assert!(login.use_github_copilot);
+        assert!(!login.use_device_code);
+        assert!(!login.with_api_key);
+    }
+
+    #[test]
+    fn login_github_copilot_conflicts_with_with_api_key() {
+        let result =
+            MultitoolCli::try_parse_from(["codex", "login", "--github-copilot", "--with-api-key"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_resume_accepts_output_last_message_flag_after_subcommand() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "exec",
+            "resume",
+            "session-123",
+            "-o",
+            "/tmp/resume-output.md",
+            "re-review",
+        ])
+        .expect("parse should succeed");
+
+        let Some(Subcommand::Exec(exec)) = cli.subcommand else {
+            panic!("expected exec subcommand");
+        };
+        let Some(codex_exec::Command::Resume(args)) = exec.command else {
+            panic!("expected exec resume");
+        };
+
+        assert_eq!(
+            exec.last_message_file,
+            Some(std::path::PathBuf::from("/tmp/resume-output.md"))
+        );
+        assert_eq!(args.session_id.as_deref(), Some("session-123"));
+        assert_eq!(args.prompt.as_deref(), Some("re-review"));
+    }
+
+    fn app_server_from_args(args: &[&str]) -> AppServerCommand {
+        let cli = MultitoolCli::try_parse_from(args).expect("parse");
+        let Subcommand::AppServer(app_server) = cli.subcommand.expect("app-server present") else {
+            unreachable!()
+        };
+        app_server
     }
 
     fn sample_exit_info(conversation: Option<&str>) -> AppExitInfo {
