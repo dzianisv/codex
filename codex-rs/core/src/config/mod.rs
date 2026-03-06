@@ -1013,6 +1013,27 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
         .map_err(|err| std::io::Error::other(format!("failed to persist config.toml: {err}")))
 }
 
+/// Save the default model provider to config.toml.
+pub fn set_default_model_provider(codex_home: &Path, provider: &str) -> std::io::Result<()> {
+    if !built_in_model_providers().contains_key(provider) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid model provider '{provider}'"),
+        ));
+    }
+    use toml_edit::value;
+
+    let edits = [ConfigEdit::SetPath {
+        segments: vec!["model_provider".to_string()],
+        value: value(provider),
+    }];
+
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits(edits)
+        .apply_blocking()
+        .map_err(|err| std::io::Error::other(format!("failed to persist config.toml: {err}")))
+}
+
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]

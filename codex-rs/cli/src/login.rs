@@ -6,6 +6,7 @@ use codex_core::auth::CLIENT_ID;
 use codex_core::auth::login_with_api_key;
 use codex_core::auth::logout;
 use codex_core::config::Config;
+use codex_core::config::set_default_model_provider;
 use codex_login::ServerOptions;
 use codex_login::run_device_code_login;
 use codex_login::run_github_copilot_login;
@@ -178,16 +179,13 @@ pub async fn run_login_with_github_copilot(cli_config_overrides: CliConfigOverri
         }
     };
 
-    match login_with_api_key(
+    match save_github_copilot_login(
         &config.codex_home,
         &copilot_token,
         config.cli_auth_credentials_store_mode,
     ) {
         Ok(_) => {
             eprintln!("{LOGIN_SUCCESS_MESSAGE}");
-            eprintln!(
-                "To use GitHub Copilot, set `model_provider = \"{GITHUB_COPILOT_PROVIDER_ID}\"`."
-            );
             std::process::exit(0);
         }
         Err(e) => {
@@ -195,6 +193,15 @@ pub async fn run_login_with_github_copilot(cli_config_overrides: CliConfigOverri
             std::process::exit(1);
         }
     }
+}
+
+fn save_github_copilot_login(
+    codex_home: &std::path::Path,
+    copilot_token: &str,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    login_with_api_key(codex_home, copilot_token, auth_credentials_store_mode)?;
+    set_default_model_provider(codex_home, GITHUB_COPILOT_PROVIDER_ID)
 }
 
 /// Prefers device-code login (with `open_browser = false`) when headless environment is detected, but keeps
@@ -339,6 +346,10 @@ fn safe_format_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::safe_format_key;
+    use super::save_github_copilot_login;
+    use codex_core::GITHUB_COPILOT_PROVIDER_ID;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use tempfile::tempdir;
 
     #[test]
     fn formats_long_key() {
@@ -350,5 +361,26 @@ mod tests {
     fn short_key_returns_stars() {
         let key = "sk-proj-12345";
         assert_eq!(safe_format_key(key), "***");
+    }
+
+    #[test]
+    fn github_copilot_login_persists_model_provider_selection() {
+        let codex_home = tempdir().expect("create temp dir");
+
+        save_github_copilot_login(
+            codex_home.path(),
+            "copilot-test-token",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("save GitHub Copilot auth");
+
+        let config_contents = std::fs::read_to_string(codex_home.path().join("config.toml"))
+            .expect("read config.toml");
+        assert!(
+            config_contents.contains(&format!(
+                "model_provider = \"{GITHUB_COPILOT_PROVIDER_ID}\""
+            )),
+            "expected GitHub Copilot login to set default provider, got:\n{config_contents}"
+        );
     }
 }
