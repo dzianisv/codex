@@ -240,7 +240,20 @@ pub(crate) fn auth_provider_from_auth(
     auth: Option<CodexAuth>,
     provider: &ModelProviderInfo,
 ) -> crate::error::Result<CoreAuthProvider> {
-    if let Some(api_key) = provider.api_key()? {
+    let auth_token = auth.as_ref().map(CodexAuth::get_token).transpose()?;
+    let account_id = auth.as_ref().and_then(CodexAuth::get_account_id);
+
+    let provider_api_key = match provider.api_key() {
+        Ok(key) => key,
+        Err(crate::error::CodexErr::EnvVar(_))
+            if provider.is_github_copilot_provider() && auth_token.is_some() =>
+        {
+            None
+        }
+        Err(err) => return Err(err),
+    };
+
+    if let Some(api_key) = provider_api_key {
         return Ok(CoreAuthProvider {
             token: Some(api_key),
             account_id: None,
@@ -254,11 +267,10 @@ pub(crate) fn auth_provider_from_auth(
         });
     }
 
-    if let Some(auth) = auth {
-        let token = auth.get_token()?;
+    if let Some(token) = auth_token {
         Ok(CoreAuthProvider {
             token: Some(token),
-            account_id: auth.get_account_id(),
+            account_id,
         })
     } else {
         Ok(CoreAuthProvider {

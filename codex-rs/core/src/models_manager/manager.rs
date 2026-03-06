@@ -11,13 +11,18 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::models_manager::model_info;
+use codex_api::AuthProvider;
 use codex_api::ModelsClient;
 use codex_api::ReqwestTransport;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
+use http::header::ETAG;
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +35,16 @@ use tracing::info;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatModelsResponse {
+    data: Vec<OpenAiCompatModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatModel {
+    id: String,
+}
 
 /// Strategy for refreshing available models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +89,7 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
         model_catalog: Option<ModelsResponse>,
         collaboration_modes_config: CollaborationModesConfig,
+        provider: ModelProviderInfo,
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
@@ -95,7 +111,7 @@ impl ModelsManager {
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
-            provider: ModelProviderInfo::create_openai_provider(),
+            provider,
         }
     }
 
@@ -245,7 +261,9 @@ impl ModelsManager {
             return Ok(());
         }
 
-        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt) {
+        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt)
+            && !self.provider.is_github_copilot_provider()
+        {
             if matches!(
                 refresh_strategy,
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
@@ -280,21 +298,95 @@ impl ModelsManager {
     async fn fetch_and_update_models(&self) -> CoreResult<()> {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
+        let client_version = crate::models_manager::client_version_to_whole();
         let auth = self.auth_manager.auth().await;
         let auth_mode = self.auth_manager.auth_mode();
         let api_provider = self.provider.to_api_provider(auth_mode)?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
-        let transport = ReqwestTransport::new(build_reqwest_client());
-        let client = ModelsClient::new(transport, api_provider, api_auth);
+        let models_and_etag = if self.provider.is_github_copilot_provider() {
+            let api_auth = match auth_provider_from_auth(auth.clone(), &self.provider) {
+                Ok(api_auth) => api_auth,
+                Err(CodexErr::EnvVar(_)) => {
+                    info!("models refresh skipped: github-copilot token is unavailable");
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(token) = api_auth.bearer_token() else {
+                info!("models refresh skipped: github-copilot auth token is unavailable");
+                return Ok(());
+            };
 
-        let client_version = crate::models_manager::client_version_to_whole();
-        let (models, etag) = timeout(
-            MODELS_REFRESH_TIMEOUT,
-            client.list_models(&client_version, HeaderMap::new()),
-        )
-        .await
-        .map_err(|_| CodexErr::Timeout)?
-        .map_err(map_api_error)?;
+            let url = format!("{}/models", api_provider.base_url.trim_end_matches('/'));
+            let request = build_reqwest_client()
+                .get(url)
+                .query(&[("client_version", client_version.clone())])
+                .headers(api_provider.headers.clone())
+                .bearer_auth(token);
+            let response = timeout(MODELS_REFRESH_TIMEOUT, request.send())
+                .await
+                .map_err(|_| CodexErr::Timeout)?
+                .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+            let etag = response
+                .headers()
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(CodexErr::Stream(
+                    format!(
+                        "failed to fetch models from github-copilot provider: {status}; body: {body}"
+                    ),
+                    None,
+                ));
+            }
+            let payload: OpenAiCompatModelsResponse = response
+                .json()
+                .await
+                .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+            let mut seen = HashSet::new();
+            let bundled_models = Self::load_remote_models_from_file().unwrap_or_default();
+            let models = payload
+                .data
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, model)| {
+                    if !seen.insert(model.id.clone()) {
+                        return None;
+                    }
+
+                    let mut candidate = bundled_models
+                        .iter()
+                        .find(|bundled| bundled.slug == model.id)
+                        .cloned()
+                        .unwrap_or_else(|| model_info::model_info_from_slug(&model.id));
+                    candidate.slug = model.id.clone();
+                    if candidate.display_name.is_empty() {
+                        candidate.display_name = model.id.clone();
+                    }
+                    candidate.visibility = ModelVisibility::List;
+                    candidate.supported_in_api = true;
+                    candidate.priority = i32::try_from(index).unwrap_or(i32::MAX);
+                    candidate.used_fallback_model_metadata = false;
+                    Some(candidate)
+                })
+                .collect::<Vec<_>>();
+            (models, etag)
+        } else {
+            let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let client = ModelsClient::new(transport, api_provider, api_auth);
+
+            timeout(
+                MODELS_REFRESH_TIMEOUT,
+                client.list_models(&client_version, HeaderMap::new()),
+            )
+            .await
+            .map_err(|_| CodexErr::Timeout)?
+            .map_err(map_api_error)?
+        };
+        let (models, etag) = models_and_etag;
 
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
@@ -383,11 +475,11 @@ impl ModelsManager {
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
+        let mut remote_models = Self::load_remote_models_from_file()
+            .unwrap_or_else(|err| panic!("failed to load bundled models.json: {err}"));
+        Self::inject_test_models(&mut remote_models);
         Self {
-            remote_models: RwLock::new(
-                Self::load_remote_models_from_file()
-                    .unwrap_or_else(|err| panic!("failed to load bundled models.json: {err}")),
-            ),
+            remote_models: RwLock::new(remote_models),
             catalog_mode: CatalogMode::Default,
             collaboration_modes_config: CollaborationModesConfig::default(),
             auth_manager,
@@ -395,6 +487,41 @@ impl ModelsManager {
             cache_manager,
             provider,
         }
+    }
+
+    fn inject_test_models(models: &mut Vec<ModelInfo>) {
+        Self::add_test_model(
+            models,
+            "gpt-5.1-codex",
+            "test-gpt-5.1-codex",
+            &["grep_files"],
+        );
+        Self::add_test_model(models, "gpt-5-codex", "test-gpt-5-codex", &[]);
+        Self::add_test_model(models, "gpt-5-codex", "test-gpt-5-remote", &[]);
+    }
+
+    fn add_test_model(
+        models: &mut Vec<ModelInfo>,
+        base_slug: &str,
+        test_slug: &str,
+        tools: &[&str],
+    ) {
+        if models.iter().any(|model| model.slug == test_slug) {
+            return;
+        }
+
+        let Some(base) = models.iter().find(|model| model.slug == base_slug).cloned() else {
+            return;
+        };
+
+        let mut test_model = base;
+        test_model.slug = test_slug.to_string();
+        test_model.display_name = test_slug.to_string();
+        test_model.description = Some(format!("Test model derived from {base_slug}."));
+        test_model.visibility = ModelVisibility::Hide;
+        test_model.experimental_supported_tools =
+            tools.iter().map(|tool| tool.to_string()).collect();
+        models.push(test_model);
     }
 
     /// Get model identifier without consulting remote state or cache.
@@ -441,6 +568,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
     use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
         remote_model_with_visibility(slug, display, priority, "list")
@@ -522,6 +653,7 @@ mod tests {
             auth_manager,
             None,
             CollaborationModesConfig::default(),
+            ModelProviderInfo::create_openai_provider(),
         );
         let known_slug = manager
             .get_remote_models()
@@ -562,6 +694,7 @@ mod tests {
                 models: vec![overlay],
             }),
             CollaborationModesConfig::default(),
+            ModelProviderInfo::create_openai_provider(),
         );
 
         let model_info = manager
@@ -595,6 +728,7 @@ mod tests {
                 models: vec![remote],
             }),
             CollaborationModesConfig::default(),
+            ModelProviderInfo::create_openai_provider(),
         );
         let namespaced_model = "custom/gpt-image".to_string();
 
@@ -620,6 +754,7 @@ mod tests {
             auth_manager,
             None,
             CollaborationModesConfig::default(),
+            ModelProviderInfo::create_openai_provider(),
         );
         let known_slug = manager
             .get_remote_models()
@@ -961,6 +1096,54 @@ mod tests {
             models_mock.requests().len(),
             0,
             "no auth should avoid /models requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_available_models_fetches_for_github_copilot_with_stored_token() {
+        let server = MockServer::start().await;
+        let _models_mock = wiremock::Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer copilot-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": "gpt-4.1"},
+                    {"id": "claude-3.7-sonnet"},
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.base_url = Some(server.uri());
+        // Force fallback to stored auth token instead of environment lookup.
+        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::Online)
+            .await
+            .expect("github copilot refresh should succeed");
+        let available = manager
+            .try_list_models()
+            .expect("models should be available");
+        assert!(
+            available.iter().any(|preset| preset.model == "gpt-4.1"),
+            "expected gpt-4.1 to be listed"
+        );
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "claude-3.7-sonnet"),
+            "expected claude-3.7-sonnet to be listed"
         );
     }
 

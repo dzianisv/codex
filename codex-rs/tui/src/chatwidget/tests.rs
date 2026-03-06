@@ -30,6 +30,7 @@ use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::skills::model::SkillMetadata;
 use codex_core::terminal::TerminalName;
 use codex_otel::OtelManager;
@@ -114,6 +115,9 @@ use pretty_assertions::assert_eq;
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
@@ -1754,6 +1758,7 @@ async fn make_chatwidget_manual(
         auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
+        cfg.model_provider.clone(),
     ));
     let reasoning_effort = None;
     let base_mode = CollaborationMode {
@@ -1884,6 +1889,7 @@ fn set_chatgpt_auth(chat: &mut ChatWidget) {
         chat.auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
+        chat.config.model_provider.clone(),
     ));
 }
 
@@ -6907,6 +6913,94 @@ async fn model_selection_popup_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("model_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn model_selection_popup_lists_github_copilot_remote_models() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test /models server");
+    let addr = listener.local_addr().expect("models server address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept /models connection");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request).to_string();
+        assert!(
+            request.starts_with("GET /models?"),
+            "expected GET /models request, got:\n{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer copilot-test-token"),
+            "expected bearer token in Authorization header, got:\n{request}"
+        );
+
+        let response_body = serde_json::json!({
+            "data": [
+                {"id": "gpt-4.1"},
+                {"id": "copilot-only-model-123"},
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write /models response");
+    });
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-4.1")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    let mut provider = chat.config.model_provider.clone();
+    provider.name = "GitHub Copilot".to_string();
+    provider.base_url = Some(format!("http://{addr}"));
+    // Ensure auth comes from stored auth token, not process env.
+    provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+    chat.config.model_provider = provider.clone();
+
+    chat.auth_manager = codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key(
+        "copilot-test-token",
+    ));
+    chat.models_manager = Arc::new(ModelsManager::new(
+        chat.config.codex_home.clone(),
+        chat.auth_manager.clone(),
+        None,
+        CollaborationModesConfig::default(),
+        provider,
+    ));
+    let refreshed_models = chat
+        .models_manager
+        .list_models(RefreshStrategy::Online)
+        .await;
+    server.join().expect("models server should complete");
+    assert!(
+        refreshed_models
+            .iter()
+            .any(|preset| preset.model == "copilot-only-model-123"),
+        "expected Copilot-only model in refreshed model list"
+    );
+
+    chat.open_model_popup();
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(
+        popup.contains("copilot-only-model-123"),
+        "expected Copilot-only model in /model popup, got:\n{popup}"
+    );
 }
 
 #[tokio::test]
