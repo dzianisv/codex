@@ -621,6 +621,7 @@ async fn handle_model_migration_prompt_if_needed(
                 app_event_tx.send(AppEvent::UpdateModel(target_model.clone()));
                 app_event_tx.send(AppEvent::UpdateReasoningEffort(mapped_effort));
                 app_event_tx.send(AppEvent::PersistModelSelection {
+                    provider: None,
                     model: target_model.clone(),
                     effort: mapped_effort,
                 });
@@ -2428,15 +2429,17 @@ impl App {
             AppEvent::OpenRealtimeAudioDeviceSelection { kind } => {
                 self.chat_widget.open_realtime_audio_device_selection(kind);
             }
-            AppEvent::OpenReasoningPopup { model } => {
-                self.chat_widget.open_reasoning_popup(model);
+            AppEvent::OpenReasoningPopup { provider_id, model } => {
+                self.chat_widget
+                    .open_reasoning_popup_for_provider(provider_id, model);
             }
             AppEvent::OpenPlanReasoningScopePrompt { model, effort } => {
                 self.chat_widget
                     .open_plan_reasoning_scope_prompt(model, effort);
             }
             AppEvent::OpenAllModelsPopup { models } => {
-                self.chat_widget.open_all_models_popup(models);
+                self.chat_widget
+                    .open_all_models_popup_with_provider_presets(models);
             }
             AppEvent::OpenFullAccessConfirmation {
                 preset,
@@ -2782,23 +2785,55 @@ impl App {
                     let _ = (preset, mode);
                 }
             }
-            AppEvent::PersistModelSelection { model, effort } => {
+            AppEvent::PersistModelSelection {
+                provider,
+                model,
+                effort,
+            } => {
                 let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
+                let selected_provider = provider
+                    .as_deref()
+                    .unwrap_or(self.config.model_provider_id.as_str());
+                let provider_changed = selected_provider != self.config.model_provider_id;
+
+                let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
                     .with_profile(profile)
-                    .set_model(Some(model.as_str()), effort)
-                    .apply()
-                    .await
-                {
+                    .set_model(Some(model.as_str()), effort);
+                if let Some(provider_id) = provider.as_deref() {
+                    let segments = if let Some(profile) = profile {
+                        vec![
+                            "profiles".to_string(),
+                            profile.to_string(),
+                            "model_provider".to_string(),
+                        ]
+                    } else {
+                        vec!["model_provider".to_string()]
+                    };
+                    builder = builder.with_edits([ConfigEdit::SetPath {
+                        segments,
+                        value: provider_id.to_string().into(),
+                    }]);
+                }
+
+                match builder.apply().await {
                     Ok(()) => {
                         let effort_label = effort
                             .map(|selected_effort| selected_effort.to_string())
                             .unwrap_or_else(|| "default".to_string());
-                        tracing::info!("Selected model: {model}, Selected effort: {effort_label}");
-                        let mut message = format!("Model changed to {model}");
+                        tracing::info!(
+                            "Selected model: {model}, provider: {selected_provider}, effort: {effort_label}"
+                        );
+                        let mut message = if provider_changed {
+                            format!("Saved model selection {selected_provider}/{model}")
+                        } else {
+                            format!("Model changed to {model}")
+                        };
                         if let Some(label) = Self::reasoning_label_for(&model, effort) {
                             message.push(' ');
                             message.push_str(label);
+                        }
+                        if provider_changed {
+                            message.push_str(". Start a new session to apply provider change");
                         }
                         if let Some(profile) = profile {
                             message.push_str(" for ");
@@ -2814,11 +2849,12 @@ impl App {
                         );
                         if let Some(profile) = profile {
                             self.chat_widget.add_error_message(format!(
-                                "Failed to save model for profile `{profile}`: {err}"
+                                "Failed to save model/provider for profile `{profile}`: {err}"
                             ));
                         } else {
-                            self.chat_widget
-                                .add_error_message(format!("Failed to save default model: {err}"));
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save default model/provider: {err}"
+                            ));
                         }
                     }
                 }

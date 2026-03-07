@@ -2578,6 +2578,7 @@ async fn reasoning_selection_in_plan_mode_model_switch_does_not_open_scope_promp
 #[tokio::test]
 async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
+    let expected_provider = chat.config_ref().model_provider_id.clone();
     chat.open_plan_reasoning_scope_prompt(
         "gpt-5.1-codex-max".to_string(),
         Some(ReasoningEffortConfig::High),
@@ -2604,8 +2605,8 @@ async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override(
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::PersistModelSelection { model, effort: Some(ReasoningEffortConfig::High) }
-                if model == "gpt-5.1-codex-max"
+            AppEvent::PersistModelSelection { provider: Some(provider), model, effort: Some(ReasoningEffortConfig::High) }
+                if provider == &expected_provider && model == "gpt-5.1-codex-max"
         )),
         "expected global model reasoning selection persistence; events: {events:?}"
     );
@@ -7101,6 +7102,18 @@ async fn experimental_features_popup_snapshot() {
 }
 
 #[tokio::test]
+async fn experimental_popup_marks_reflection_enabled_when_runtime_reflection_is_enabled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.set_feature_enabled(Feature::Reflection, false);
+    chat.set_reflection_enabled(true);
+    chat.open_experimental_popup();
+
+    let popup = render_bottom_popup(&chat, 120);
+    assert_snapshot!("experimental_popup_reflection_runtime_enabled", popup);
+}
+
+#[tokio::test]
 async fn experimental_features_toggle_saves_on_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -7616,6 +7629,47 @@ async fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("model_reasoning_selection_popup_extra_high_warning", popup);
+}
+
+#[tokio::test]
+async fn cross_provider_reasoning_selection_persists_provider_without_runtime_switch() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
+
+    let mut preset = get_available_model(&chat, "gpt-5.1-codex-max");
+    let effort = preset.default_reasoning_effort;
+    preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+        effort,
+        description: "default".to_string(),
+    }];
+    let model = preset.model.clone();
+    chat.open_reasoning_popup_for_provider("github-copilot".to_string(), preset);
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::PersistModelSelection {
+                provider: Some(provider),
+                model: selected_model,
+                effort: Some(selected_effort),
+            } if provider == "github-copilot"
+                && selected_model == &model
+                && *selected_effort == effort
+        )),
+        "expected cross-provider selection to persist provider + model; events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateModel(_))),
+        "did not expect in-session model update for cross-provider selection; events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(_))),
+        "did not expect in-session reasoning update for cross-provider selection; events: {events:?}"
+    );
 }
 
 #[tokio::test]
