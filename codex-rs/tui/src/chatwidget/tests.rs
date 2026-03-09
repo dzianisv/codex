@@ -22,6 +22,8 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
+use codex_core::config::types::McpServerConfig;
+use codex_core::config::types::McpServerTransportConfig;
 use codex_core::config::types::Notifications;
 #[cfg(target_os = "windows")]
 use codex_core::config::types::WindowsSandboxModeToml;
@@ -116,6 +118,7 @@ use pretty_assertions::assert_eq;
 #[cfg(target_os = "windows")]
 use serial_test::serial;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Read;
 use std::io::Write;
@@ -7102,10 +7105,10 @@ async fn experimental_features_popup_snapshot() {
 }
 
 #[tokio::test]
-async fn experimental_popup_marks_reflection_enabled_when_runtime_reflection_is_enabled() {
+async fn experimental_popup_marks_reflection_enabled_when_feature_flag_is_enabled() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.set_feature_enabled(Feature::Reflection, false);
+    chat.set_feature_enabled(Feature::Reflection, true);
     chat.set_reflection_enabled(true);
     chat.open_experimental_popup();
 
@@ -7227,6 +7230,52 @@ async fn model_selection_popup_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("model_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn model_slash_command_requests_open_model_popup_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.dispatch_command(SlashCommand::Model);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenModelPopup));
+}
+
+#[tokio::test]
+async fn mcp_slash_command_with_restart_args_submits_refresh_op() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.config
+        .mcp_servers
+        .set(HashMap::from([(
+            "docs".to_string(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: "echo".to_string(),
+                    args: vec!["ok".to_string()],
+                    env: None,
+                    env_vars: Vec::new(),
+                    cwd: None,
+                },
+                enabled: true,
+                required: false,
+                disabled_reason: None,
+                startup_timeout_sec: None,
+                tool_timeout_sec: None,
+                enabled_tools: None,
+                disabled_tools: None,
+                scopes: None,
+                oauth_resource: None,
+            },
+        )]))
+        .expect("set test MCP server");
+
+    chat.dispatch_command_with_args(SlashCommand::Mcp, "restart".to_string(), Vec::new());
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RefreshMcpServers { config }) if config.mcp_servers["docs"]["command"] == "echo"
+    );
 }
 
 #[tokio::test]

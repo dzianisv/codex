@@ -118,6 +118,7 @@ use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::ListCustomPromptsResponseEvent;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpListToolsResponseEvent;
+use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::McpStartupCompleteEvent;
 use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
@@ -3951,7 +3952,14 @@ impl ChatWidget {
                 self.show_rename_prompt();
             }
             SlashCommand::Model => {
-                self.open_model_popup();
+                if !self.is_session_configured() {
+                    self.add_info_message(
+                        "Model selection is disabled until startup completes.".to_string(),
+                        None,
+                    );
+                    return;
+                }
+                self.app_event_tx.send(AppEvent::OpenModelPopup);
             }
             SlashCommand::Fast => {
                 let next_tier = if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
@@ -4338,6 +4346,24 @@ impl ChatWidget {
                         path: prepared_args,
                     });
                 self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Mcp => {
+                if trimmed.is_empty() {
+                    self.dispatch_command(cmd);
+                    return;
+                }
+
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "list" | "status" => {
+                        self.add_mcp_output();
+                    }
+                    "restart" | "refresh" | "reset" => {
+                        self.refresh_mcp_servers();
+                    }
+                    _ => {
+                        self.add_error_message("Usage: /mcp [list|status|restart]".to_string());
+                    }
+                }
             }
             _ => self.dispatch_command(cmd),
         }
@@ -5780,6 +5806,7 @@ impl ChatWidget {
 
     /// Open a popup to choose a quick auto model. Selecting "All models"
     /// opens the full picker with every available preset.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_model_popup(&mut self) {
         if !self.is_session_configured() {
             self.add_info_message(
@@ -5802,6 +5829,7 @@ impl ChatWidget {
         self.open_model_popup_with_provider_presets(presets);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn provider_model_presets_for_picker(&self) -> Result<Vec<ProviderModelPreset>, TryLockError> {
         let active_provider_id = self.config.model_provider_id.clone();
         let mut provider_ids: Vec<String> = self.config.model_providers.keys().cloned().collect();
@@ -6122,7 +6150,10 @@ impl ChatWidget {
         self.open_model_popup_with_provider_presets(provider_presets);
     }
 
-    fn open_model_popup_with_provider_presets(&mut self, presets: Vec<ProviderModelPreset>) {
+    pub(crate) fn open_model_popup_with_provider_presets(
+        &mut self,
+        presets: Vec<ProviderModelPreset>,
+    ) {
         let presets: Vec<ProviderModelPreset> = presets
             .into_iter()
             .filter(|preset| preset.model.show_in_picker)
@@ -6852,12 +6883,9 @@ impl ChatWidget {
         });
     }
 
+    // Reflection visibility is driven by feature flags; legacy reflection settings are synced separately.
     fn is_experimental_feature_enabled(&self, feature: Feature) -> bool {
-        if feature == Feature::Reflection {
-            self.config.features.enabled(feature) || self.config.reflection.enabled
-        } else {
-            self.config.features.enabled(feature)
-        }
+        self.config.features.enabled(feature)
     }
 
     pub(crate) fn open_experimental_popup(&mut self) {
@@ -7957,6 +7985,47 @@ impl ChatWidget {
             self.add_to_history(history_cell::empty_mcp_output());
         } else {
             self.submit_op(Op::ListMcpTools);
+        }
+    }
+
+    fn refresh_mcp_servers(&mut self) {
+        let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
+            self.config.codex_home.clone(),
+        )));
+        let configured_servers = mcp_manager.configured_servers(&self.config);
+        if configured_servers.is_empty() {
+            self.add_to_history(history_cell::empty_mcp_output());
+            return;
+        }
+
+        let mcp_servers = match serde_json::to_value(configured_servers) {
+            Ok(value) => value,
+            Err(err) => {
+                self.add_error_message(format!("Failed to serialize MCP servers: {err}"));
+                return;
+            }
+        };
+        let mcp_oauth_credentials_store_mode =
+            match serde_json::to_value(self.config.mcp_oauth_credentials_store_mode) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.add_error_message(format!(
+                        "Failed to serialize MCP OAuth credentials store mode: {err}"
+                    ));
+                    return;
+                }
+            };
+
+        if self.submit_op(Op::RefreshMcpServers {
+            config: McpServerRefreshConfig {
+                mcp_servers,
+                mcp_oauth_credentials_store_mode,
+            },
+        }) {
+            self.add_info_message(
+                "Queued MCP server refresh.".to_string(),
+                Some("MCP servers reconnect on the next active turn.".to_string()),
+            );
         }
     }
 
