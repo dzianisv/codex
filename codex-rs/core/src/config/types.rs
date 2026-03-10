@@ -943,6 +943,58 @@ impl Default for ShellEnvironmentPolicy {
     }
 }
 
+/// Configuration for the reflection/judge feature.
+/// This controls how task completion is verified by a separate "judge" model.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ReflectionConfigToml {
+    /// Enable or disable reflection. When enabled, a judge model evaluates
+    /// task completion after each turn. Defaults to false.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Model to use for reflection/judging. If not set, uses the same model
+    /// as the main agent. Can be set to a cheaper/faster model like "gpt-4o-mini".
+    pub model: Option<String>,
+
+    /// Maximum number of reflection attempts before giving up.
+    /// Defaults to 3.
+    pub max_attempts: Option<u32>,
+}
+
+/// Runtime reflection configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReflectionConfig {
+    /// Whether reflection is enabled.
+    pub enabled: bool,
+
+    /// Model to use for reflection/judging.
+    pub model: Option<String>,
+
+    /// Maximum number of reflection attempts.
+    pub max_attempts: u32,
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            max_attempts: 3,
+        }
+    }
+}
+
+impl From<ReflectionConfigToml> for ReflectionConfig {
+    fn from(toml: ReflectionConfigToml) -> Self {
+        Self {
+            enabled: toml.enabled.unwrap_or(false),
+            model: toml.model,
+            max_attempts: toml.max_attempts.unwrap_or(3),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "types_tests.rs"]
 mod tests;

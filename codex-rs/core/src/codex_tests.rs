@@ -2300,11 +2300,12 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     let config = Arc::new(config);
 
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
+    let models_manager = Arc::new(ModelsManager::new_with_provider(
         config.codex_home.clone(),
         auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
+        config.model_provider.clone(),
     ));
     let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
     let model_info = ModelsManager::construct_model_info_offline_for_tests(model.as_str(), &config);
@@ -2390,11 +2391,12 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let config = Arc::new(config);
     let conversation_id = ThreadId::default();
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
+    let models_manager = Arc::new(ModelsManager::new_with_provider(
         config.codex_home.clone(),
         auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
+        config.model_provider.clone(),
     ));
     let agent_control = AgentControl::default();
     let exec_policy = ExecPolicyManager::default();
@@ -3181,11 +3183,12 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let config = Arc::new(config);
     let conversation_id = ThreadId::default();
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
+    let models_manager = Arc::new(ModelsManager::new_with_provider(
         config.codex_home.clone(),
         auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
+        config.model_provider.clone(),
     ));
     let agent_control = AgentControl::default();
     let exec_policy = ExecPolicyManager::default();

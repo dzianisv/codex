@@ -237,6 +237,30 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 );
             }
             EventMsg::GuardianAssessment(_) => {}
+            EventMsg::ReflectionVerdict(ev) => {
+                if ev.completed {
+                    ts_msg!(
+                        self,
+                        "{} Task completed (confidence: {:.0}%)",
+                        "✓ reflection:".style(self.green).style(self.bold),
+                        ev.confidence * 100.0
+                    );
+                    ts_msg!(self, "  {}", ev.reasoning.style(self.dimmed));
+                } else {
+                    ts_msg!(
+                        self,
+                        "{} Task incomplete - attempt {}/{} (confidence: {:.0}%)",
+                        "⟳ reflection:".style(self.yellow).style(self.bold),
+                        ev.attempt,
+                        ev.max_attempts,
+                        ev.confidence * 100.0
+                    );
+                    ts_msg!(self, "  Reasoning: {}", ev.reasoning.style(self.dimmed));
+                    if let Some(feedback) = &ev.feedback {
+                        ts_msg!(self, "  Feedback: {}", feedback.style(self.yellow));
+                    }
+                }
+            }
             EventMsg::ModelReroute(_) => {}
             EventMsg::DeprecationNotice(DeprecationNoticeEvent { summary, details }) => {
                 ts_msg!(

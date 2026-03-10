@@ -11,8 +11,10 @@ use crate::config::types::MemoriesToml;
 use crate::config::types::ModelAvailabilityNuxConfig;
 use crate::config::types::NotificationMethod;
 use crate::config::types::Notifications;
+use crate::config::types::ReflectionConfig;
 use crate::config_loader::RequirementSource;
 use crate::features::Feature;
+use crate::model_provider_info::GITHUB_COPILOT_PROVIDER_ID;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -4268,6 +4270,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults().into(),
             suppress_unstable_features_warning: false,
+            reflection: ReflectionConfig::default(),
             active_profile: Some("o3".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -4407,6 +4410,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         ghost_snapshot: GhostSnapshotConfig::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
+        reflection: ReflectionConfig::default(),
         active_profile: Some("gpt3".to_string()),
         active_project: ProjectConfig { trust_level: None },
         windows_wsl_setup_acknowledged: false,
@@ -4544,6 +4548,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         ghost_snapshot: GhostSnapshotConfig::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
+        reflection: ReflectionConfig::default(),
         active_profile: Some("zdr".to_string()),
         active_project: ProjectConfig { trust_level: None },
         windows_wsl_setup_acknowledged: false,
@@ -4667,6 +4672,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         ghost_snapshot: GhostSnapshotConfig::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
+        reflection: ReflectionConfig::default(),
         active_profile: Some("gpt5".to_string()),
         active_project: ProjectConfig { trust_level: None },
         windows_wsl_setup_acknowledged: false,
@@ -6056,4 +6062,35 @@ fn test_tui_notification_method() {
     let parsed: RootTomlTest =
         toml::from_str(toml).expect("deserialize notification_method=\"bel\"");
     assert_eq!(parsed.tui.notification_method, NotificationMethod::Bel);
+}
+
+#[test]
+fn set_default_model_provider_accepts_github_copilot() {
+    let codex_home = tempdir().expect("tempdir");
+
+    set_default_model_provider(codex_home.path(), GITHUB_COPILOT_PROVIDER_ID)
+        .expect("github-copilot should be a valid built-in provider");
+
+    let config_toml = std::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE))
+        .expect("read config.toml");
+    let parsed: ConfigToml = toml::from_str(&config_toml).expect("parse config.toml");
+
+    assert_eq!(
+        parsed.model_provider.as_deref(),
+        Some(GITHUB_COPILOT_PROVIDER_ID)
+    );
+}
+
+#[test]
+fn reserved_model_provider_ids_reject_github_copilot_override() {
+    let config_toml = r#"
+[model_providers.github-copilot]
+name = "Custom Copilot"
+base_url = "http://localhost:11434/v1"
+"#;
+
+    let err = toml::from_str::<ConfigToml>(config_toml).expect_err("should reject override");
+    let message = err.to_string();
+    assert!(message.contains("reserved built-in provider IDs"));
+    assert!(message.contains("`github-copilot`"));
 }

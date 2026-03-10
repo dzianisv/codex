@@ -8,6 +8,9 @@ use codex_protocol::openai_models::ModelsResponse;
 use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
 use tempfile::tempdir;
 use wiremock::MockServer;
 
@@ -527,6 +530,86 @@ async fn refresh_available_models_skips_network_without_chatgpt_auth() {
         models_mock.requests().len(),
         0,
         "no auth should avoid /models requests"
+    );
+}
+
+#[tokio::test]
+async fn refresh_available_models_fetches_github_copilot_catalog_with_api_key_auth() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept /models connection");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request).to_string();
+        assert!(
+            request.starts_with("GET /models?"),
+            "expected GET /models request, got:\n{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer copilot-test-token"),
+            "expected bearer token in Authorization header, got:\n{request}"
+        );
+
+        let response_body = serde_json::json!({
+            "data": [
+                {"id": "copilot-only-model-123"},
+                {"id": "copilot-only-model-123"},
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write /models response");
+    });
+
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+    let mut provider = ModelProviderInfo::create_github_copilot_provider();
+    provider.base_url = Some(format!("http://{addr}"));
+    // Ensure auth comes from stored auth token, not process env.
+    provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+    let manager = ModelsManager::with_provider_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+    );
+
+    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+    server.join().expect("models server should complete");
+
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "copilot-only-model-123"),
+        "expected Copilot-only model in available list"
+    );
+    assert_eq!(
+        available
+            .iter()
+            .filter(|preset| preset.model == "copilot-only-model-123")
+            .count(),
+        1,
+        "duplicate Copilot catalog entries should be deduplicated"
     );
 }
 

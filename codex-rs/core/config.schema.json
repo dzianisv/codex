@@ -437,6 +437,9 @@
             "realtime_conversation": {
               "type": "boolean"
             },
+            "reflection": {
+              "type": "boolean"
+            },
             "remote_models": {
               "type": "boolean"
             },
@@ -1417,6 +1420,28 @@
         }
       ]
     },
+    "ReflectionConfigToml": {
+      "additionalProperties": false,
+      "description": "Configuration for the reflection/judge feature. This controls how task completion is verified by a separate \"judge\" model.",
+      "properties": {
+        "enabled": {
+          "default": null,
+          "description": "Enable or disable reflection. When enabled, a judge model evaluates task completion after each turn. Defaults to false.",
+          "type": "boolean"
+        },
+        "max_attempts": {
+          "description": "Maximum number of reflection attempts before giving up. Defaults to 3.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "model": {
+          "description": "Model to use for reflection/judging. If not set, uses the same model as the main agent. Can be set to a cheaper/faster model like \"gpt-4o-mini\".",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -1995,6 +2020,9 @@
         "realtime_conversation": {
           "type": "boolean"
         },
+        "reflection": {
+          "type": "boolean"
+        },
         "remote_models": {
           "type": "boolean"
         },
@@ -2357,6 +2385,15 @@
       ],
       "default": null,
       "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
+    },
+    "reflection": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ReflectionConfigToml"
+        }
+      ],
+      "default": null,
+      "description": "Configuration for the reflection/judge feature."
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",

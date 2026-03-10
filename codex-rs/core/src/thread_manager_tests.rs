@@ -1,6 +1,7 @@
 use super::*;
 use crate::codex::make_session_and_context;
 use crate::config::test_config;
+use crate::model_provider_info::GITHUB_COPILOT_PROVIDER_ID;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::RefreshStrategy;
 use assert_matches::assert_matches;
@@ -10,6 +11,9 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
 use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::MockServer;
@@ -184,4 +188,88 @@ async fn new_uses_configured_openai_provider_for_model_refresh() {
 
     let _ = manager.list_models(RefreshStrategy::Online).await;
     assert_eq!(models_mock.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn new_uses_active_github_copilot_provider_for_model_refresh() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept /models connection");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request).to_string();
+        assert!(
+            request.starts_with("GET /models?"),
+            "expected GET /models request, got:\n{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer copilot-thread-token"),
+            "expected bearer token in Authorization header, got:\n{request}"
+        );
+
+        let response_body = serde_json::json!({
+            "data": [
+                {"id": "copilot-thread-model"},
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write /models response");
+    });
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config();
+    config.codex_home = temp_dir.path().join("codex-home");
+    config.cwd = config.codex_home.clone();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    config.model_catalog = None;
+
+    let mut provider = ModelProviderInfo::create_github_copilot_provider();
+    provider.base_url = Some(format!("http://{addr}"));
+    // Ensure auth comes from stored auth token, not process env.
+    provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+    config.model_provider_id = GITHUB_COPILOT_PROVIDER_ID.to_string();
+    config.model_provider = provider.clone();
+    config
+        .model_providers
+        .insert(GITHUB_COPILOT_PROVIDER_ID.to_string(), provider);
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-thread-token"));
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager,
+        SessionSource::Exec,
+        CollaborationModesConfig::default(),
+    );
+
+    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+    server.join().expect("models server should complete");
+
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "copilot-thread-model"),
+        "expected Copilot provider refresh to populate the selected model"
+    );
 }

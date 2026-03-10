@@ -188,6 +188,8 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Enable Responses API websocket v2 mode.
     ResponsesWebsocketsV2,
+    /// Reflection layer that verifies task completion via a judge model.
+    Reflection,
 }
 
 impl Feature {
@@ -609,6 +611,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::RuntimeMetrics,
         key: "runtime_metrics",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Reflection,
+        key: "reflection",
+        stage: Stage::Experimental {
+            name: "Reflection",
+            menu_description: "Run a reflection judge pass before Codex finalizes a response.",
+            announcement: "NEW: Reflection is now available in /experimental. Enable it to try judge-based completion checks.",
+        },
         default_enabled: false,
     },
     FeatureSpec {

@@ -66,6 +66,12 @@ pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderModelPreset {
+    pub(crate) provider_id: String,
+    pub(crate) model: ModelPreset,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -182,6 +188,9 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
+    /// Refresh provider model catalogs and open the model picker.
+    OpenModelPopup,
+
     /// Update the active collaboration mask in the running app and widget.
     UpdateCollaborationMode(CollaborationModeMask),
 
@@ -190,6 +199,7 @@ pub(crate) enum AppEvent {
 
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {
+        provider: Option<String>,
         model: String,
         effort: Option<ReasoningEffort>,
     },
@@ -226,6 +236,7 @@ pub(crate) enum AppEvent {
 
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
+        provider_id: String,
         model: ModelPreset,
     },
 
@@ -237,7 +248,7 @@ pub(crate) enum AppEvent {
 
     /// Open the full model picker (non-auto models).
     OpenAllModelsPopup {
-        models: Vec<ModelPreset>,
+        models: Vec<ProviderModelPreset>,
     },
 
     /// Open the confirmation prompt before enabling full access mode.

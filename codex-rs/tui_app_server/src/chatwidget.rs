@@ -128,6 +128,7 @@ use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::ReflectionVerdictEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
@@ -2106,6 +2107,18 @@ impl ChatWidget {
 
     fn on_warning(&mut self, message: impl Into<String>) {
         self.add_to_history(history_cell::new_warning_event(message.into()));
+        self.request_redraw();
+    }
+
+    fn on_reflection_verdict(&mut self, ev: ReflectionVerdictEvent) {
+        self.add_to_history(history_cell::new_reflection_verdict(
+            ev.completed,
+            ev.confidence,
+            ev.reasoning,
+            ev.feedback,
+            ev.attempt,
+            ev.max_attempts,
+        ));
         self.request_redraw();
     }
 
@@ -5223,6 +5236,7 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            EventMsg::ReflectionVerdict(ev) => self.on_reflection_verdict(ev),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
             EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
                 call_id,

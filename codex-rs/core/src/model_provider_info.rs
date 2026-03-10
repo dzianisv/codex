@@ -30,6 +30,10 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
+const GITHUB_COPILOT_PROVIDER_NAME: &str = "GitHub Copilot";
+const GITHUB_COPILOT_TOKEN_ENV_KEY: &str = "GITHUB_COPILOT_TOKEN";
+const GITHUB_COPILOT_TOKEN_INSTRUCTIONS: &str =
+    "Set GITHUB_COPILOT_TOKEN to a valid GitHub Copilot bearer token before starting Codex.";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub(crate) const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub(crate) const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -130,6 +134,10 @@ pub struct ModelProviderInfo {
 }
 
 impl ModelProviderInfo {
+    pub(crate) fn is_github_copilot_provider(&self) -> bool {
+        self.name == GITHUB_COPILOT_PROVIDER_NAME
+    }
+
     fn build_header_map(&self) -> crate::error::Result<HeaderMap> {
         let capacity = self.http_headers.as_ref().map_or(0, HashMap::len)
             + self.env_http_headers.as_ref().map_or(0, HashMap::len);
@@ -277,10 +285,38 @@ impl ModelProviderInfo {
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
+
+    pub fn create_github_copilot_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: GITHUB_COPILOT_PROVIDER_NAME.into(),
+            base_url: Some("https://api.githubcopilot.com".into()),
+            env_key: Some(GITHUB_COPILOT_TOKEN_ENV_KEY.into()),
+            env_key_instructions: Some(GITHUB_COPILOT_TOKEN_INSTRUCTIONS.into()),
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: Some(
+                [(
+                    "Openai-Intent".to_string(),
+                    "conversation-edits".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
 }
 
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
 pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
+pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
@@ -292,12 +328,15 @@ pub fn built_in_model_providers(
     use ModelProviderInfo as P;
     let openai_provider = P::create_openai_provider(openai_base_url);
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // Keep the built-in set intentionally small (OpenAI, GitHub Copilot, and
+    // OSS locals). Users can add any other providers via `model_providers` in
+    // config.toml.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
+        (
+            GITHUB_COPILOT_PROVIDER_ID,
+            P::create_github_copilot_provider(),
+        ),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),

@@ -10,8 +10,12 @@ use codex_core::CodexThread;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
+use serde_json;
 use std::path::PathBuf;
 
 pub mod apps_test_server;
@@ -142,12 +146,58 @@ pub fn fetch_dotslash_file(
 /// temporary directory. Using a per-test directory keeps tests hermetic and
 /// avoids clobbering a developer’s real `~/.codex`.
 pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
-    ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(default_test_overrides())
         .build()
         .await
-        .expect("defaults for test should always succeed")
+        .expect("defaults for test should always succeed");
+
+    let existing_catalog = config.model_catalog.take();
+    config.model_catalog = Some(build_test_model_catalog(existing_catalog));
+
+    config
+}
+
+fn build_test_model_catalog(existing: Option<ModelsResponse>) -> ModelsResponse {
+    let mut response = existing.unwrap_or_else(|| {
+        serde_json::from_str(include_str!("../../models.json"))
+            .expect("bundled models.json should parse")
+    });
+
+    add_test_model(
+        &mut response.models,
+        "gpt-5.1-codex",
+        "test-gpt-5.1-codex",
+        &["grep_files"],
+    );
+    add_test_model(&mut response.models, "gpt-5-codex", "test-gpt-5-codex", &[]);
+    add_test_model(
+        &mut response.models,
+        "gpt-5-codex",
+        "test-gpt-5-remote",
+        &[],
+    );
+
+    response
+}
+
+fn add_test_model(models: &mut Vec<ModelInfo>, base_slug: &str, test_slug: &str, tools: &[&str]) {
+    if models.iter().any(|model| model.slug == test_slug) {
+        return;
+    }
+
+    let Some(base) = models.iter().find(|model| model.slug == base_slug).cloned() else {
+        return;
+    };
+
+    let mut test_model = base;
+    test_model.slug = test_slug.to_string();
+    test_model.display_name = test_slug.to_string();
+    test_model.description = Some(format!("Test model derived from {base_slug}."));
+    test_model.visibility = ModelVisibility::Hide;
+    test_model.experimental_supported_tools = tools.iter().map(|tool| tool.to_string()).collect();
+    models.push(test_model);
 }
 
 #[cfg(target_os = "linux")]

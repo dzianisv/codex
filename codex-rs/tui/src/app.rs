@@ -1,6 +1,7 @@
 use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
+use crate::app_event::ProviderModelPreset;
 use crate::app_event::RealtimeAudioDeviceKind;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
@@ -42,6 +43,7 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::GITHUB_COPILOT_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -53,6 +55,7 @@ use codex_core::config::types::ModelAvailabilityNuxConfig;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::Feature;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_core::models_manager::manager::ModelsManager;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
@@ -151,6 +154,25 @@ fn guardian_approvals_mode() -> GuardianApprovalsMode {
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+
+fn startup_models_refresh_strategy(config: &Config) -> RefreshStrategy {
+    if config.model_provider_id == GITHUB_COPILOT_PROVIDER_ID {
+        // Copilot-only models come from the provider `/models` endpoint and
+        // are not present in bundled `models.json`.
+        RefreshStrategy::OnlineIfUncached
+    } else {
+        RefreshStrategy::Offline
+    }
+}
+
+fn model_picker_refresh_strategy(provider_id: &str) -> RefreshStrategy {
+    if provider_id == GITHUB_COPILOT_PROVIDER_ID {
+        // Keep Copilot list fresh in `/model` so newly supported models show up.
+        RefreshStrategy::OnlineIfUncached
+    } else {
+        RefreshStrategy::Offline
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -634,6 +656,7 @@ async fn handle_model_migration_prompt_if_needed(
                 app_event_tx.send(AppEvent::UpdateModel(target_model.clone()));
                 app_event_tx.send(AppEvent::UpdateReasoningEffort(mapped_effort));
                 app_event_tx.send(AppEvent::PersistModelSelection {
+                    provider: None,
                     model: target_model.clone(),
                     effort: mapped_effort,
                 });
@@ -791,11 +814,41 @@ impl App {
             .wrap_err_with(|| format!("Failed to rebuild config for cwd {cwd_display}"))
     }
 
+    async fn synchronize_reflection_legacy_setting(config: &mut Config) -> Result<()> {
+        let reflection_enabled = config.features.enabled(Feature::Reflection);
+        if config.reflection.enabled == reflection_enabled {
+            return Ok(());
+        }
+
+        config.reflection.enabled = reflection_enabled;
+        if let Err(err) = ConfigEditsBuilder::new(&config.codex_home)
+            .with_edits([ConfigEdit::SetPath {
+                segments: vec!["reflection".to_string(), "enabled".to_string()],
+                value: reflection_enabled.into(),
+            }])
+            .apply()
+            .await
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "failed to synchronize legacy reflection.enabled with features.reflection: {err}"
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn refresh_in_memory_config_from_disk(&mut self) -> Result<()> {
         let mut config = self
             .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.clone())
             .await?;
         self.apply_runtime_policy_overrides(&mut config);
+        Self::synchronize_reflection_legacy_setting(&mut config).await?;
+        self.chat_widget.set_feature_enabled(
+            Feature::Reflection,
+            config.features.enabled(Feature::Reflection),
+        );
+        self.chat_widget
+            .set_reflection_enabled(config.reflection.enabled);
         self.config = config;
         Ok(())
     }
@@ -891,6 +944,61 @@ impl App {
         true
     }
 
+    async fn provider_model_presets_for_picker(&self) -> Vec<ProviderModelPreset> {
+        let active_provider_id = self.config.model_provider_id.clone();
+        let mut provider_ids: Vec<String> = self.config.model_providers.keys().cloned().collect();
+        if !provider_ids
+            .iter()
+            .any(|provider_id| provider_id == &active_provider_id)
+        {
+            provider_ids.push(active_provider_id.clone());
+        }
+        provider_ids.sort_unstable_by(|left, right| {
+            (left != &active_provider_id)
+                .cmp(&(right != &active_provider_id))
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut presets = Vec::new();
+        for provider_id in provider_ids {
+            let refresh_strategy = model_picker_refresh_strategy(provider_id.as_str());
+            let provider_models = if provider_id == active_provider_id {
+                self.server
+                    .get_models_manager()
+                    .list_models(refresh_strategy)
+                    .await
+            } else {
+                let Some(provider) = self.config.model_providers.get(&provider_id).cloned() else {
+                    continue;
+                };
+                let manager = ModelsManager::new_with_provider(
+                    self.config.codex_home.clone(),
+                    self.auth_manager.clone(),
+                    None,
+                    CollaborationModesConfig::default(),
+                    provider,
+                );
+                manager.list_models(refresh_strategy).await
+            };
+            presets.extend(
+                provider_models
+                    .into_iter()
+                    .map(|model| ProviderModelPreset {
+                        provider_id: provider_id.clone(),
+                        model,
+                    }),
+            );
+        }
+
+        presets
+    }
+
+    async fn open_model_popup(&mut self) {
+        let presets = self.provider_model_presets_for_picker().await;
+        self.chat_widget
+            .open_model_popup_with_provider_presets(presets);
+    }
+
     async fn update_feature_flags(&mut self, updates: Vec<(Feature, bool)>) {
         if updates.is_empty() {
             return;
@@ -915,6 +1023,7 @@ impl App {
         let mut approval_policy_override = None;
         let mut approvals_reviewer_override = None;
         let mut sandbox_policy_override = None;
+        let mut reflection_changed = false;
         let mut feature_updates_to_apply = Vec::with_capacity(updates.len());
         // Guardian Approvals owns `approvals_reviewer`, but disabling the
         // feature from inside a profile should not silently clear a value
@@ -1031,6 +1140,14 @@ impl App {
                 approval_policy_override = Some(guardian_approvals_preset.approval_policy);
                 sandbox_policy_override = Some(guardian_approvals_preset.sandbox_policy.clone());
             }
+            if feature == Feature::Reflection {
+                feature_config.reflection.enabled = effective_enabled;
+                feature_edits.push(ConfigEdit::SetPath {
+                    segments: vec!["reflection".to_string(), "enabled".to_string()],
+                    value: effective_enabled.into(),
+                });
+                reflection_changed = true;
+            }
             next_config = feature_config;
             feature_updates_to_apply.push((feature, effective_enabled));
             builder = builder
@@ -1052,6 +1169,10 @@ impl App {
         for (feature, effective_enabled) in feature_updates_to_apply {
             self.chat_widget
                 .set_feature_enabled(feature, effective_enabled);
+        }
+        if reflection_changed {
+            self.chat_widget
+                .set_reflection_enabled(self.config.reflection.enabled);
         }
         if approvals_reviewer_override.is_some() {
             self.set_approvals_reviewer_in_app_and_widget(self.config.approvals_reviewer);
@@ -1962,6 +2083,12 @@ impl App {
         use tokio_stream::StreamExt;
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
+        if let Err(err) = Self::synchronize_reflection_legacy_setting(&mut config).await {
+            tracing::warn!(
+                error = %err,
+                "failed to synchronize legacy reflection.enabled with features.reflection at startup"
+            );
+        }
         emit_project_config_warnings(&app_event_tx, &config);
         tui.set_notification_method(config.tui_notification_method);
 
@@ -1981,13 +2108,14 @@ impl App {
         thread_manager
             .plugins_manager()
             .maybe_start_curated_repo_sync_for_config(&config);
+        let startup_refresh_strategy = startup_models_refresh_strategy(&config);
         let mut model = thread_manager
             .get_models_manager()
-            .get_default_model(&config.model, RefreshStrategy::Offline)
+            .get_default_model(&config.model, startup_refresh_strategy)
             .await;
         let available_models = thread_manager
             .get_models_manager()
-            .list_models(RefreshStrategy::Offline)
+            .list_models(startup_refresh_strategy)
             .await;
         let exit_info = handle_model_migration_prompt_if_needed(
             tui,
@@ -2730,6 +2858,9 @@ impl App {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_line();
             }
+            AppEvent::OpenModelPopup => {
+                self.open_model_popup().await;
+            }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);
                 self.refresh_status_line();
@@ -2740,15 +2871,17 @@ impl App {
             AppEvent::OpenRealtimeAudioDeviceSelection { kind } => {
                 self.chat_widget.open_realtime_audio_device_selection(kind);
             }
-            AppEvent::OpenReasoningPopup { model } => {
-                self.chat_widget.open_reasoning_popup(model);
+            AppEvent::OpenReasoningPopup { provider_id, model } => {
+                self.chat_widget
+                    .open_reasoning_popup_for_provider(provider_id, model);
             }
             AppEvent::OpenPlanReasoningScopePrompt { model, effort } => {
                 self.chat_widget
                     .open_plan_reasoning_scope_prompt(model, effort);
             }
             AppEvent::OpenAllModelsPopup { models } => {
-                self.chat_widget.open_all_models_popup(models);
+                self.chat_widget
+                    .open_all_models_popup_with_provider_presets(models);
             }
             AppEvent::OpenFullAccessConfirmation {
                 preset,
@@ -3096,23 +3229,55 @@ impl App {
                     let _ = (preset, mode);
                 }
             }
-            AppEvent::PersistModelSelection { model, effort } => {
+            AppEvent::PersistModelSelection {
+                provider,
+                model,
+                effort,
+            } => {
                 let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
+                let selected_provider = provider
+                    .as_deref()
+                    .unwrap_or(self.config.model_provider_id.as_str());
+                let provider_changed = selected_provider != self.config.model_provider_id;
+
+                let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
                     .with_profile(profile)
-                    .set_model(Some(model.as_str()), effort)
-                    .apply()
-                    .await
-                {
+                    .set_model(Some(model.as_str()), effort);
+                if let Some(provider_id) = provider.as_deref() {
+                    let segments = if let Some(profile) = profile {
+                        vec![
+                            "profiles".to_string(),
+                            profile.to_string(),
+                            "model_provider".to_string(),
+                        ]
+                    } else {
+                        vec!["model_provider".to_string()]
+                    };
+                    builder = builder.with_edits([ConfigEdit::SetPath {
+                        segments,
+                        value: provider_id.to_string().into(),
+                    }]);
+                }
+
+                match builder.apply().await {
                     Ok(()) => {
                         let effort_label = effort
                             .map(|selected_effort| selected_effort.to_string())
                             .unwrap_or_else(|| "default".to_string());
-                        tracing::info!("Selected model: {model}, Selected effort: {effort_label}");
-                        let mut message = format!("Model changed to {model}");
+                        tracing::info!(
+                            "Selected model: {model}, provider: {selected_provider}, effort: {effort_label}"
+                        );
+                        let mut message = if provider_changed {
+                            format!("Saved model selection {selected_provider}/{model}")
+                        } else {
+                            format!("Model changed to {model}")
+                        };
                         if let Some(label) = Self::reasoning_label_for(&model, effort) {
                             message.push(' ');
                             message.push_str(label);
+                        }
+                        if provider_changed {
+                            message.push_str(". Start a new session to apply provider change");
                         }
                         if let Some(profile) = profile {
                             message.push_str(" for ");
@@ -3128,11 +3293,12 @@ impl App {
                         );
                         if let Some(profile) = profile {
                             self.chat_widget.add_error_message(format!(
-                                "Failed to save model for profile `{profile}`: {err}"
+                                "Failed to save model/provider for profile `{profile}`: {err}"
                             ));
                         } else {
-                            self.chat_widget
-                                .add_error_message(format!("Failed to save default model: {err}"));
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save default model/provider: {err}"
+                            ));
                         }
                     }
                 }
@@ -4230,6 +4396,9 @@ mod tests {
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -4251,6 +4420,120 @@ mod tests {
         assert_eq!(
             normalized.additional_writable_roots,
             vec![base_cwd.join("rel")]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_model_refresh_is_offline_for_default_provider() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+
+        assert_eq!(
+            startup_models_refresh_strategy(&config),
+            RefreshStrategy::Offline
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_model_refresh_fetches_remote_for_github_copilot() -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.model_provider_id = GITHUB_COPILOT_PROVIDER_ID.to_string();
+
+        assert_eq!(
+            startup_models_refresh_strategy(&config),
+            RefreshStrategy::OnlineIfUncached
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_picker_refresh_fetches_remote_for_github_copilot() {
+        assert_eq!(
+            model_picker_refresh_strategy(GITHUB_COPILOT_PROVIDER_ID),
+            RefreshStrategy::OnlineIfUncached
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_model_presets_for_picker_fetches_copilot_models_for_inactive_provider()
+    -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept /models connection");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let request = String::from_utf8_lossy(&request).to_string();
+            assert!(
+                request.starts_with("GET /models?"),
+                "expected GET /models request, got:\n{request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer copilot-test-token"),
+                "expected bearer token in Authorization header, got:\n{request}"
+            );
+
+            let response_body = serde_json::json!({
+                "data": [
+                    {"id": "gemini-3-pro"},
+                ]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write /models response");
+        });
+
+        let mut app = make_test_app().await;
+        app.auth_manager = codex_core::test_support::auth_manager_from_auth(
+            CodexAuth::from_api_key("copilot-test-token"),
+        );
+
+        let copilot_provider = app
+            .config
+            .model_providers
+            .get_mut(GITHUB_COPILOT_PROVIDER_ID)
+            .expect("github-copilot provider should exist");
+        copilot_provider.base_url = Some(format!("http://{addr}"));
+        // Ensure auth comes from stored auth token, not process env.
+        copilot_provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+
+        let presets = app.provider_model_presets_for_picker().await;
+        server.join().expect("models server should complete");
+
+        assert!(
+            presets.iter().any(|preset| {
+                preset.provider_id == GITHUB_COPILOT_PROVIDER_ID
+                    && preset.model.model == "gemini-3-pro"
+            }),
+            "expected gemini-3-pro in Copilot provider presets"
         );
         Ok(())
     }
@@ -5923,6 +6206,93 @@ guardian_approval = true
     }
 
     #[tokio::test]
+    async fn update_feature_flags_disabling_reflection_turns_off_legacy_reflection_config()
+    -> Result<()> {
+        let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[reflection]\nenabled = true\n",
+        )?;
+        app.config.reflection.enabled = true;
+        app.chat_widget.set_reflection_enabled(true);
+        app.chat_widget
+            .set_feature_enabled(Feature::Reflection, false);
+
+        app.update_feature_flags(vec![(Feature::Reflection, false)])
+            .await;
+
+        assert!(!app.config.features.enabled(Feature::Reflection));
+        assert!(
+            !app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::Reflection)
+        );
+        assert!(!app.config.reflection.enabled);
+        assert!(!app.chat_widget.config_ref().reflection.enabled);
+        assert!(
+            op_rx.try_recv().is_err(),
+            "feature toggle should not patch the active session"
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(config.contains("[reflection]"));
+        assert!(config.contains("enabled = false"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disable_reflection_via_experimental_then_reload_stays_disabled() -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[features]\nreflection = true\n\n[reflection]\nenabled = true\n",
+        )?;
+
+        app.chat_widget
+            .set_feature_enabled(Feature::Reflection, true);
+        app.chat_widget.set_reflection_enabled(true);
+
+        // Simulate disabling reflection from `/experimental`.
+        app.update_feature_flags(vec![(Feature::Reflection, false)])
+            .await;
+
+        assert!(!app.config.features.enabled(Feature::Reflection));
+        assert!(!app.config.reflection.enabled);
+        assert!(
+            !app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::Reflection)
+        );
+        assert!(!app.chat_widget.config_ref().reflection.enabled);
+
+        // Simulate `/reflection` route re-checking state after config reload.
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert!(!app.config.features.enabled(Feature::Reflection));
+        assert!(!app.config.reflection.enabled);
+        assert!(
+            !app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::Reflection)
+        );
+        assert!(!app.chat_widget.config_ref().reflection.enabled);
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(config.contains("[features]"));
+        assert!(!config.contains("reflection = true"));
+        assert!(config.contains("[reflection]"));
+        assert!(config.contains("enabled = false"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn open_agent_picker_allows_existing_agent_threads_when_feature_is_disabled() -> Result<()>
     {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
@@ -6860,6 +7230,39 @@ guardian_approval = true
             app_enabled_in_effective_config(&app.config, &app_id),
             Some(false)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_normalizes_reflection_legacy_setting() -> Result<()>
+    {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[features]\nreflection = false\n\n[reflection]\nenabled = true\n",
+        )?;
+
+        app.chat_widget
+            .set_feature_enabled(Feature::Reflection, true);
+        app.chat_widget.set_reflection_enabled(true);
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert!(!app.config.features.enabled(Feature::Reflection));
+        assert!(!app.config.reflection.enabled);
+        assert!(
+            !app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::Reflection)
+        );
+        assert!(!app.chat_widget.config_ref().reflection.enabled);
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(config.contains("[reflection]"));
+        assert!(config.contains("enabled = false"));
         Ok(())
     }
 

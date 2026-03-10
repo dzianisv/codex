@@ -40,6 +40,8 @@ use crate::realtime_conversation::handle_audio as handle_realtime_conversation_a
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
+use crate::reflection::ReflectionContext;
+use crate::reflection::evaluate_reflection;
 use crate::rollout::session_index;
 use crate::skills::render_skills_section;
 use crate::stream_events_utils::HandleOutputCtx;
@@ -98,6 +100,7 @@ use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::RawResponseItemEvent;
+use codex_protocol::protocol::ReflectionVerdictEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
@@ -5407,6 +5410,27 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+/// Extract the initial task/prompt from user input.
+fn extract_initial_task_from_input(input: &[UserInput]) -> String {
+    for item in input {
+        match item {
+            UserInput::Text { text, .. } => {
+                return text.clone();
+            }
+            UserInput::Skill { name, .. } => {
+                return format!("Run skill: {}", name);
+            }
+            UserInput::Image { .. } | UserInput::LocalImage { .. } | UserInput::Mention { .. } => {
+                // Skip, look for text or skill entries.
+            }
+            _ => {
+                // Non-exhaustive variants are ignored for the initial-task heuristic.
+            }
+        }
+    }
+    "(No initial task found)".to_string()
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -5431,6 +5455,9 @@ pub(crate) async fn run_turn(
     if input.is_empty() {
         return None;
     }
+
+    // Extract initial task for reflection BEFORE input is consumed.
+    let initial_task = extract_initial_task_from_input(&input);
 
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
@@ -5624,6 +5651,21 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
+    let mut reflection_attempt: u32 = 0;
+    let reflection_config = turn_context.config.reflection.clone();
+    let reflection_enabled = reflection_config.enabled || sess.enabled(Feature::Reflection);
+    let reflection_model_info = if reflection_enabled {
+        Some(if let Some(model) = reflection_config.model.as_deref() {
+            sess.services
+                .models_manager
+                .get_model_info(model, &turn_context.config)
+                .await
+        } else {
+            turn_context.model_info.clone()
+        })
+    } else {
+        None
+    };
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -5835,6 +5877,100 @@ pub(crate) async fn run_turn(
                     }
                     if stop_outcome.should_stop {
                         break;
+                    }
+
+                    // Run reflection if enabled and we haven't exceeded max attempts.
+                    let max_attempts = reflection_config.max_attempts;
+                    if reflection_enabled && reflection_attempt < max_attempts {
+                        reflection_attempt += 1;
+                        info!(
+                            "Running reflection evaluation (attempt {}/{})",
+                            reflection_attempt, max_attempts
+                        );
+
+                        let history_items = sess
+                            .clone_history()
+                            .await
+                            .for_prompt(&turn_context.model_info.input_modalities);
+                        let context = ReflectionContext::from_conversation(
+                            initial_task.clone(),
+                            &history_items,
+                            reflection_attempt,
+                            max_attempts,
+                        );
+
+                        let reflection_model_info = reflection_model_info
+                            .as_ref()
+                            .expect("reflection model info");
+                        match evaluate_reflection(
+                            &sess.services.model_client,
+                            reflection_model_info,
+                            &turn_context.session_telemetry,
+                            context,
+                        )
+                        .await
+                        {
+                            Ok(verdict) => {
+                                info!(
+                                    "Reflection verdict: completed={}, confidence={:.2}",
+                                    verdict.completed, verdict.confidence
+                                );
+
+                                sess.send_event(
+                                    &turn_context,
+                                    EventMsg::ReflectionVerdict(ReflectionVerdictEvent {
+                                        completed: verdict.completed,
+                                        confidence: verdict.confidence,
+                                        reasoning: verdict.reasoning.clone(),
+                                        feedback: verdict.feedback.clone(),
+                                        attempt: reflection_attempt,
+                                        max_attempts,
+                                    }),
+                                )
+                                .await;
+
+                                if !verdict.completed {
+                                    if let Some(feedback) = verdict.feedback {
+                                        info!(
+                                            "Task incomplete, injecting reflection feedback: {}",
+                                            feedback
+                                        );
+
+                                        let feedback_msg = format!(
+                                            "[Reflection Judge - Attempt {}/{}] Task verification failed.\n\nReasoning: {}\n\nFeedback: {}\n\nPlease address the above feedback and complete the task.",
+                                            reflection_attempt,
+                                            max_attempts,
+                                            verdict.reasoning,
+                                            feedback
+                                        );
+
+                                        let feedback_item = ResponseItem::Message {
+                                            id: None,
+                                            role: "user".to_string(),
+                                            content: vec![ContentItem::InputText {
+                                                text: feedback_msg,
+                                            }],
+                                            end_turn: None,
+                                            phase: None,
+                                        };
+
+                                        sess.record_conversation_items(
+                                            &turn_context,
+                                            std::slice::from_ref(&feedback_item),
+                                        )
+                                        .await;
+
+                                        // Continue the loop to process the feedback.
+                                        continue;
+                                    }
+                                } else {
+                                    info!("Reflection: Task completed successfully");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Reflection evaluation failed: {}", e);
+                            }
+                        }
                     }
                     let hook_outcomes = sess
                         .hooks()
@@ -6737,6 +6873,7 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::PlanDelta(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
+        | EventMsg::ReflectionVerdict(_)
         | EventMsg::CollabAgentSpawnBegin(_)
         | EventMsg::CollabAgentSpawnEnd(_)
         | EventMsg::CollabAgentInteractionBegin(_)

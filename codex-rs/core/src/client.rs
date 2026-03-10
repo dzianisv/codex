@@ -184,6 +184,8 @@ impl RequestRouteTelemetry {
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     state: Arc<ModelClientState>,
+    /// Optional model override for specialized use cases (e.g., reflection judge).
+    model_override: Option<String>,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -281,7 +283,16 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
+            model_override: None,
         }
+    }
+
+    /// Returns a clone of this client with a different model for API requests.
+    /// Useful for specialized tasks like reflection judging.
+    pub fn with_model_override(&self, model: &str) -> Self {
+        let mut client = self.clone();
+        client.model_override = Some(model.to_string());
+        client
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -294,6 +305,12 @@ impl ModelClient {
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
         }
+    }
+
+    fn resolve_model_slug(&self, model_info: &ModelInfo) -> String {
+        self.model_override
+            .clone()
+            .unwrap_or_else(|| model_info.slug.clone())
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
@@ -367,7 +384,6 @@ impl ModelClient {
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
-        let instructions = prompt.base_instructions.text.clone();
         let input = prompt.get_formatted_input();
         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
         let reasoning = Self::build_reasoning(model_info, effort, summary);
@@ -383,8 +399,10 @@ impl ModelClient {
             None
         };
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
+        let instructions = prompt.base_instructions.text.clone();
+        let model = self.resolve_model_slug(model_info);
         let payload = ApiCompactionInput {
-            model: &model_info.slug,
+            model: model.as_str(),
             input: &input,
             instructions: &instructions,
             tools,
@@ -435,8 +453,9 @@ impl ModelClient {
             ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
+        let model = self.resolve_model_slug(model_info);
         let payload = ApiMemorySummarizeInput {
-            model: model_info.slug.clone(),
+            model,
             raw_memories,
             reasoning: effort.map(|effort| Reasoning {
                 effort: Some(effort),
@@ -722,8 +741,9 @@ impl ModelClientSession {
         };
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
         let prompt_cache_key = Some(self.client.state.conversation_id.to_string());
+        let model = self.client.resolve_model_slug(model_info);
         let request = ResponsesApiRequest {
-            model: model_info.slug.clone(),
+            model,
             instructions: instructions.clone(),
             input,
             tools,
