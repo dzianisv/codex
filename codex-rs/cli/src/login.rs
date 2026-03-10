@@ -8,14 +8,17 @@
 //! support can request from users.
 
 use codex_core::CodexAuth;
+use codex_core::GITHUB_COPILOT_PROVIDER_ID;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::AuthMode;
 use codex_core::auth::CLIENT_ID;
 use codex_core::auth::login_with_api_key;
 use codex_core::auth::logout;
 use codex_core::config::Config;
+use codex_core::config::set_default_model_provider;
 use codex_login::ServerOptions;
 use codex_login::run_device_code_login;
+use codex_login::run_github_copilot_login;
 use codex_login::run_login_server;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_utils_cli::CliConfigOverrides;
@@ -249,6 +252,48 @@ pub async fn run_login_with_device_code(
     }
 }
 
+/// Login using GitHub Copilot OAuth device code flow.
+pub async fn run_login_with_github_copilot(cli_config_overrides: CliConfigOverrides) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+
+    if matches!(config.forced_login_method, Some(ForcedLoginMethod::Chatgpt)) {
+        eprintln!("{API_KEY_LOGIN_DISABLED_MESSAGE}");
+        std::process::exit(1);
+    }
+
+    let copilot_token = match run_github_copilot_login().await {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("Error logging in with GitHub Copilot: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match save_github_copilot_login(
+        &config.codex_home,
+        &copilot_token,
+        config.cli_auth_credentials_store_mode,
+    ) {
+        Ok(_) => {
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Error saving GitHub Copilot credentials: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn save_github_copilot_login(
+    codex_home: &std::path::Path,
+    copilot_token: &str,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    login_with_api_key(codex_home, copilot_token, auth_credentials_store_mode)?;
+    set_default_model_provider(codex_home, GITHUB_COPILOT_PROVIDER_ID)
+}
+
 /// Prefers device-code login (with `open_browser = false`) when headless environment is detected, but keeps
 /// `codex login` working in environments where device-code may be disabled/feature-gated.
 /// If `run_device_code_login` returns `ErrorKind::NotFound` ("device-code unsupported"), this
@@ -393,6 +438,10 @@ fn safe_format_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::safe_format_key;
+    use super::save_github_copilot_login;
+    use codex_core::GITHUB_COPILOT_PROVIDER_ID;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use tempfile::tempdir;
 
     #[test]
     fn formats_long_key() {
@@ -404,5 +453,26 @@ mod tests {
     fn short_key_returns_stars() {
         let key = "sk-proj-12345";
         assert_eq!(safe_format_key(key), "***");
+    }
+
+    #[test]
+    fn github_copilot_login_persists_model_provider_selection() {
+        let codex_home = tempdir().expect("create temp dir");
+
+        save_github_copilot_login(
+            codex_home.path(),
+            "copilot-test-token",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("save GitHub Copilot auth");
+
+        let config_contents = std::fs::read_to_string(codex_home.path().join("config.toml"))
+            .expect("read config.toml");
+        assert!(
+            config_contents.contains(&format!(
+                "model_provider = \"{GITHUB_COPILOT_PROVIDER_ID}\""
+            )),
+            "expected GitHub Copilot login to set default provider, got:\n{config_contents}"
+        );
     }
 }

@@ -22,6 +22,8 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
+use codex_core::config::types::McpServerConfig;
+use codex_core::config::types::McpServerTransportConfig;
 use codex_core::config::types::Notifications;
 #[cfg(target_os = "windows")]
 use codex_core::config::types::WindowsSandboxModeToml;
@@ -30,6 +32,7 @@ use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::skills::model::SkillMetadata;
 use codex_core::terminal::TerminalName;
 use codex_otel::RuntimeMetricsSummary;
@@ -113,7 +116,11 @@ use pretty_assertions::assert_eq;
 #[cfg(target_os = "windows")]
 use serial_test::serial;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
@@ -1801,6 +1808,7 @@ async fn make_chatwidget_manual(
         auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
+        cfg.model_provider.clone(),
     ));
     let reasoning_effort = None;
     let base_mode = CollaborationMode {
@@ -1943,6 +1951,7 @@ fn set_chatgpt_auth(chat: &mut ChatWidget) {
         chat.auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
+        chat.config.model_provider.clone(),
     ));
 }
 
@@ -2570,6 +2579,7 @@ async fn reasoning_selection_in_plan_mode_model_switch_does_not_open_scope_promp
 #[tokio::test]
 async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
+    let expected_provider = chat.config_ref().model_provider_id.clone();
     chat.open_plan_reasoning_scope_prompt(
         "gpt-5.1-codex-max".to_string(),
         Some(ReasoningEffortConfig::High),
@@ -2596,8 +2606,8 @@ async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override(
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::PersistModelSelection { model, effort: Some(ReasoningEffortConfig::High) }
-                if model == "gpt-5.1-codex-max"
+            AppEvent::PersistModelSelection { provider: Some(provider), model, effort: Some(ReasoningEffortConfig::High) }
+                if provider == &expected_provider && model == "gpt-5.1-codex-max"
         )),
         "expected global model reasoning selection persistence; events: {events:?}"
     );
@@ -7079,6 +7089,18 @@ async fn experimental_features_popup_snapshot() {
 }
 
 #[tokio::test]
+async fn experimental_popup_marks_reflection_enabled_when_feature_flag_is_enabled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.set_feature_enabled(Feature::Reflection, true);
+    chat.set_reflection_enabled(true);
+    chat.open_experimental_popup();
+
+    let popup = render_bottom_popup(&chat, 120);
+    assert_snapshot!("experimental_popup_reflection_runtime_enabled", popup);
+}
+
+#[tokio::test]
 async fn experimental_features_toggle_saves_on_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -7208,6 +7230,140 @@ async fn model_selection_popup_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("model_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn model_slash_command_requests_open_model_popup_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.dispatch_command(SlashCommand::Model);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenModelPopup));
+}
+
+#[tokio::test]
+async fn mcp_slash_command_with_restart_args_submits_refresh_op() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.config
+        .mcp_servers
+        .set(HashMap::from([(
+            "docs".to_string(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: "echo".to_string(),
+                    args: vec!["ok".to_string()],
+                    env: None,
+                    env_vars: Vec::new(),
+                    cwd: None,
+                },
+                enabled: true,
+                required: false,
+                disabled_reason: None,
+                startup_timeout_sec: None,
+                tool_timeout_sec: None,
+                enabled_tools: None,
+                disabled_tools: None,
+                scopes: None,
+                oauth_resource: None,
+            },
+        )]))
+        .expect("set test MCP server");
+
+    chat.dispatch_command_with_args(SlashCommand::Mcp, "restart".to_string(), Vec::new());
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RefreshMcpServers { config }) if config.mcp_servers["docs"]["command"] == "echo"
+    );
+}
+
+#[tokio::test]
+async fn model_selection_popup_lists_github_copilot_remote_models() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test /models server");
+    let addr = listener.local_addr().expect("models server address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept /models connection");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request).to_string();
+        assert!(
+            request.starts_with("GET /models?"),
+            "expected GET /models request, got:\n{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer copilot-test-token"),
+            "expected bearer token in Authorization header, got:\n{request}"
+        );
+
+        let response_body = serde_json::json!({
+            "data": [
+                {"id": "gpt-4.1"},
+                {"id": "copilot-only-model-123"},
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write /models response");
+    });
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-4.1")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    let mut provider = chat.config.model_provider.clone();
+    provider.name = "GitHub Copilot".to_string();
+    provider.base_url = Some(format!("http://{addr}"));
+    // Ensure auth comes from stored auth token, not process env.
+    provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+    chat.config.model_provider = provider.clone();
+
+    chat.auth_manager = codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key(
+        "copilot-test-token",
+    ));
+    chat.models_manager = Arc::new(ModelsManager::new(
+        chat.config.codex_home.clone(),
+        chat.auth_manager.clone(),
+        None,
+        CollaborationModesConfig::default(),
+        provider,
+    ));
+    let refreshed_models = chat
+        .models_manager
+        .list_models(RefreshStrategy::Online)
+        .await;
+    server.join().expect("models server should complete");
+    assert!(
+        refreshed_models
+            .iter()
+            .any(|preset| preset.model == "copilot-only-model-123"),
+        "expected Copilot-only model in refreshed model list"
+    );
+
+    chat.open_model_popup();
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(
+        popup.contains("copilot-only-model-123"),
+        "expected Copilot-only model in /model popup, got:\n{popup}"
+    );
 }
 
 #[tokio::test]
@@ -7522,6 +7678,47 @@ async fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("model_reasoning_selection_popup_extra_high_warning", popup);
+}
+
+#[tokio::test]
+async fn cross_provider_reasoning_selection_persists_provider_without_runtime_switch() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
+
+    let mut preset = get_available_model(&chat, "gpt-5.1-codex-max");
+    let effort = preset.default_reasoning_effort;
+    preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+        effort,
+        description: "default".to_string(),
+    }];
+    let model = preset.model.clone();
+    chat.open_reasoning_popup_for_provider("github-copilot".to_string(), preset);
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::PersistModelSelection {
+                provider: Some(provider),
+                model: selected_model,
+                effort: Some(selected_effort),
+            } if provider == "github-copilot"
+                && selected_model == &model
+                && *selected_effort == effort
+        )),
+        "expected cross-provider selection to persist provider + model; events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateModel(_))),
+        "did not expect in-session model update for cross-provider selection; events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(_))),
+        "did not expect in-session reasoning update for cross-provider selection; events: {events:?}"
+    );
 }
 
 #[tokio::test]

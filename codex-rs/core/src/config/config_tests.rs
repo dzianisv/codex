@@ -9,6 +9,7 @@ use crate::config::types::MemoriesToml;
 use crate::config::types::ModelAvailabilityNuxConfig;
 use crate::config::types::NotificationMethod;
 use crate::config::types::Notifications;
+use crate::config::types::ReflectionConfig;
 use crate::config_loader::RequirementSource;
 use crate::features::Feature;
 use assert_matches::assert_matches;
@@ -3228,6 +3229,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults().into(),
             suppress_unstable_features_warning: false,
+            reflection: ReflectionConfig::default(),
             active_profile: Some("o3".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -3363,6 +3365,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         ghost_snapshot: GhostSnapshotConfig::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
+        reflection: ReflectionConfig::default(),
         active_profile: Some("gpt3".to_string()),
         active_project: ProjectConfig { trust_level: None },
         windows_wsl_setup_acknowledged: false,
@@ -3496,6 +3499,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         ghost_snapshot: GhostSnapshotConfig::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
+        reflection: ReflectionConfig::default(),
         active_profile: Some("zdr".to_string()),
         active_project: ProjectConfig { trust_level: None },
         windows_wsl_setup_acknowledged: false,
@@ -3615,6 +3619,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         ghost_snapshot: GhostSnapshotConfig::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
+        reflection: ReflectionConfig::default(),
         active_profile: Some("gpt5".to_string()),
         active_project: ProjectConfig { trust_level: None },
         windows_wsl_setup_acknowledged: false,

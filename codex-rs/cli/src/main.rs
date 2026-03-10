@@ -15,6 +15,7 @@ use codex_cli::login::run_login_status;
 use codex_cli::login::run_login_with_api_key;
 use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
+use codex_cli::login::run_login_with_github_copilot;
 use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_exec::Cli as ExecCli;
@@ -30,6 +31,7 @@ use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use supports_color::Stream;
@@ -52,13 +54,15 @@ use codex_core::features::Stage;
 use codex_core::features::is_known_feature_key;
 use codex_core::terminal::TerminalName;
 
+const CLI_VERSION: &str = env!("CODEX_CLI_VERSION");
+
 /// Codex CLI
 ///
 /// If no subcommand is specified, options will be forwarded to the interactive CLI.
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    version = CLI_VERSION,
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like
@@ -281,6 +285,14 @@ struct LoginCommand {
 
     #[arg(long = "device-auth")]
     use_device_code: bool,
+
+    #[arg(
+        long = "github-copilot",
+        visible_alias = "copilot",
+        help = "Use GitHub Copilot OAuth device code login and store the resulting token",
+        conflicts_with_all = ["with_api_key", "api_key", "use_device_code", "issuer_base_url", "client_id"]
+    )]
+    use_github_copilot: bool,
 
     /// EXPERIMENTAL: Use custom OAuth issuer base URL (advanced)
     /// Override the OAuth issuer base URL (advanced)
@@ -551,10 +563,29 @@ fn stage_str(stage: codex_core::features::Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    if should_print_version_only() {
+        println!("{CLI_VERSION}");
+        return Ok(());
+    }
+
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         cli_main(arg0_paths).await?;
         Ok(())
     })
+}
+
+fn should_print_version_only() -> bool {
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+
+    if args.next().is_some() {
+        return false;
+    }
+
+    flag == OsStr::new("--version") || flag == OsStr::new("-V")
 }
 
 async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
@@ -680,7 +711,9 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     run_login_status(login_cli.config_overrides).await;
                 }
                 None => {
-                    if login_cli.use_device_code {
+                    if login_cli.use_github_copilot {
+                        run_login_with_github_copilot(login_cli.config_overrides).await;
+                    } else if login_cli.use_device_code {
                         run_login_with_device_code(
                             login_cli.config_overrides,
                             login_cli.issuer_base_url,
@@ -1169,6 +1202,25 @@ mod tests {
         assert!(args.last);
         assert_eq!(args.session_id, None);
         assert_eq!(args.prompt.as_deref(), Some("2+2"));
+    }
+
+    #[test]
+    fn login_github_copilot_flag_parses() {
+        let cli = MultitoolCli::try_parse_from(["codex", "login", "--github-copilot"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Login(login)) = cli.subcommand else {
+            panic!("expected login subcommand");
+        };
+        assert!(login.use_github_copilot);
+        assert!(!login.use_device_code);
+        assert!(!login.with_api_key);
+    }
+
+    #[test]
+    fn login_github_copilot_conflicts_with_with_api_key() {
+        let result =
+            MultitoolCli::try_parse_from(["codex", "login", "--github-copilot", "--with-api-key"]);
+        assert!(result.is_err());
     }
 
     #[test]
