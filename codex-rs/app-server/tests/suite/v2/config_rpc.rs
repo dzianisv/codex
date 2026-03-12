@@ -89,6 +89,36 @@ sandbox_mode = "workspace-write"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_server_reload_request_returns_success() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(
+        &codex_home,
+        r#"
+[mcp_servers.docs]
+command = "echo"
+args = ["ok"]
+"#,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_raw_request("config/mcpServer/reload", Option::<serde_json::Value>::None)
+        .await?;
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    let body: serde_json::Value = to_response(resp)?;
+    assert_eq!(body, json!({}));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_read_includes_tools() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_config(

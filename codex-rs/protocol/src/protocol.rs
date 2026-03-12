@@ -394,6 +394,9 @@ pub enum Op {
     /// Request MCP servers to reinitialize and refresh cached tool lists.
     RefreshMcpServers { config: McpServerRefreshConfig },
 
+    /// Reload MCP server config from disk and reconnect servers immediately.
+    ReloadMcpServers,
+
     /// Reload user config layer overrides for the active session.
     ///
     /// This updates runtime config-derived behavior (for example app

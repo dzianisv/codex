@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -3928,6 +3929,35 @@ impl Session {
             .await;
     }
 
+    pub(crate) async fn reload_mcp_servers_from_config(&self, turn_context: &TurnContext) -> usize {
+        self.reload_user_config_layer().await;
+        let config = self.get_config().await;
+        let merged_toml = config.config_layer_stack.effective_config();
+        let mcp_servers = match merged_toml.get("mcp_servers").cloned() {
+            Some(servers_value) => {
+                match servers_value.try_into::<BTreeMap<String, McpServerConfig>>() {
+                    Ok(servers) => servers.into_iter().collect(),
+                    Err(err) => {
+                        warn!("failed to parse reloaded MCP servers from config layers: {err}");
+                        self.services
+                            .mcp_manager
+                            .configured_servers(config.as_ref())
+                    }
+                }
+            }
+            None => HashMap::new(),
+        };
+        let configured_server_count = mcp_servers.len();
+        let store_mode = merged_toml
+            .get("mcp_oauth_credentials_store")
+            .cloned()
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or(config.mcp_oauth_credentials_store_mode);
+        self.refresh_mcp_servers_inner(turn_context, mcp_servers, store_mode)
+            .await;
+        configured_server_count
+    }
+
     #[cfg(test)]
     async fn mcp_startup_cancellation_token(&self) -> CancellationToken {
         self.services
@@ -4081,6 +4111,10 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 }
                 Op::RefreshMcpServers { config } => {
                     handlers::refresh_mcp_servers(&sess, config).await;
+                    false
+                }
+                Op::ReloadMcpServers => {
+                    handlers::reload_mcp_servers(&sess).await;
                     false
                 }
                 Op::ReloadUserConfig => {
@@ -4548,6 +4582,13 @@ mod handlers {
     pub async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefreshConfig) {
         let mut guard = sess.pending_mcp_server_refresh_config.lock().await;
         *guard = Some(refresh_config);
+    }
+
+    pub async fn reload_mcp_servers(sess: &Arc<Session>) {
+        let turn_context = sess.new_default_turn().await;
+        let _ = sess
+            .reload_mcp_servers_from_config(turn_context.as_ref())
+            .await;
     }
 
     pub async fn reload_user_config(sess: &Arc<Session>) {
@@ -6135,8 +6176,11 @@ async fn run_sampling_request(
             return Err(err);
         }
 
-        // Use the configured provider-specific stream retry budget.
-        let max_retries = turn_context.provider.stream_max_retries();
+        // Use the configured provider-specific stream retry budget, but still
+        // allow one recovery attempt for transport disconnects when the
+        // stream budget is explicitly set to zero.
+        let max_retries =
+            effective_stream_retry_budget(turn_context.provider.stream_max_retries(), &err);
         if retries >= max_retries
             && client_session.try_switch_fallback_transport(
                 &turn_context.session_telemetry,
@@ -6188,6 +6232,26 @@ async fn run_sampling_request(
         } else {
             return Err(err);
         }
+    }
+}
+
+fn effective_stream_retry_budget(configured_max_retries: u64, err: &CodexErr) -> u64 {
+    if configured_max_retries == 0 && should_retry_once_on_transport_disconnect(err) {
+        1
+    } else {
+        configured_max_retries
+    }
+}
+
+fn should_retry_once_on_transport_disconnect(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::Timeout | CodexErr::ConnectionFailed(_) => true,
+        CodexErr::Stream(message, _) => {
+            message.contains("error sending request for url")
+                || message.contains("connection closed before message completed")
+                || message.contains("connection reset")
+        }
+        _ => false,
     }
 }
 

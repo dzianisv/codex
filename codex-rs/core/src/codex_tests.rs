@@ -183,6 +183,36 @@ fn assistant_message_stream_parsers_can_be_seeded_from_output_item_added_text() 
 }
 
 #[test]
+fn effective_stream_retry_budget_allows_one_retry_for_transport_disconnect_when_disabled() {
+    let err = CodexErr::Stream(
+        "error sending request for url (https://example.com/v1/responses)".to_string(),
+        None,
+    );
+
+    assert_eq!(effective_stream_retry_budget(0, &err), 1);
+}
+
+#[test]
+fn effective_stream_retry_budget_does_not_retry_once_for_non_transport_stream_error() {
+    let err = CodexErr::Stream(
+        "Incomplete response returned, reason: content_filter".to_string(),
+        None,
+    );
+
+    assert_eq!(effective_stream_retry_budget(0, &err), 0);
+}
+
+#[test]
+fn effective_stream_retry_budget_preserves_nonzero_configured_budget() {
+    let err = CodexErr::Stream(
+        "error sending request for url (https://example.com/v1/responses)".to_string(),
+        None,
+    );
+
+    assert_eq!(effective_stream_retry_budget(3, &err), 3);
+}
+
+#[test]
 fn assistant_message_stream_parsers_seed_buffered_prefix_stays_out_of_finish_tail() {
     let mut parsers = AssistantMessageStreamParsers::new(false);
     let item_id = "msg-1";
@@ -2850,6 +2880,48 @@ async fn refresh_mcp_servers_is_deferred_until_next_turn() {
     );
     let new_token = session.mcp_startup_cancellation_token().await;
     assert!(!new_token.is_cancelled());
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_from_config_restarts_immediately() {
+    let (session, turn_context) = make_session_and_context().await;
+    let old_token = session.mcp_startup_cancellation_token().await;
+    assert!(!old_token.is_cancelled());
+
+    let configured_server_count = session.reload_mcp_servers_from_config(&turn_context).await;
+
+    assert_eq!(configured_server_count, 0);
+    assert!(old_token.is_cancelled());
+    let new_token = session.mcp_startup_cancellation_token().await;
+    assert!(!new_token.is_cancelled());
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_from_config_reads_updated_servers_from_disk() {
+    let (session, turn_context) = make_session_and_context().await;
+    let codex_home = {
+        let state = session.state.lock().await;
+        state.session_configuration.codex_home.clone()
+    };
+    std::fs::create_dir_all(&codex_home).expect("recreate codex_home for test");
+    let config_path = codex_home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[mcp_servers.docs]
+command = "echo"
+args = ["docs"]
+
+[mcp_servers.github]
+command = "echo"
+args = ["github"]
+"#,
+    )
+    .expect("write config.toml for reload");
+
+    let configured_server_count = session.reload_mcp_servers_from_config(&turn_context).await;
+
+    assert_eq!(configured_server_count, 2);
 }
 
 #[tokio::test]

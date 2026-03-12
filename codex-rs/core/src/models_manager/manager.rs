@@ -406,18 +406,26 @@ impl ModelsManager {
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
-        let mut existing_models = Self::load_remote_models_from_file().unwrap_or_default();
-        for model in models {
-            if let Some(existing_index) = existing_models
-                .iter()
-                .position(|existing| existing.slug == model.slug)
-            {
-                existing_models[existing_index] = model;
-            } else {
-                existing_models.push(model);
+        let next_models = if self.provider.is_github_copilot_provider() {
+            // The Copilot `/models` endpoint is OpenAI-compat and returns only model ids.
+            // We already enrich each id with bundled/fallback metadata in `fetch_and_update_models`.
+            // Keep exactly that endpoint list here so picker availability is not hardcoded.
+            models
+        } else {
+            let mut existing_models = Self::load_remote_models_from_file().unwrap_or_default();
+            for model in models {
+                if let Some(existing_index) = existing_models
+                    .iter()
+                    .position(|existing| existing.slug == model.slug)
+                {
+                    existing_models[existing_index] = model;
+                } else {
+                    existing_models.push(model);
+                }
             }
-        }
-        *self.remote_models.write().await = existing_models;
+            existing_models
+        };
+        *self.remote_models.write().await = next_models;
     }
 
     fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {
@@ -1181,6 +1189,12 @@ mod tests {
             CollaborationModesConfig::default(),
             provider,
         );
+        let bundled_slug_not_in_endpoint = ModelsManager::load_remote_models_from_file()
+            .expect("bundled model catalog should load in tests")
+            .into_iter()
+            .map(|model| model.slug)
+            .find(|slug| slug != "gpt-4.1" && slug != "claude-3.7-sonnet")
+            .expect("bundled model catalog should contain non-endpoint entries");
 
         let stale_cache_slug = "cached-openai-only-model-for-copilot-test";
         manager
@@ -1204,6 +1218,12 @@ mod tests {
                 .iter()
                 .any(|preset| preset.model == stale_cache_slug),
             "stale cross-provider cache entry should not be used for github-copilot"
+        );
+        assert!(
+            !available
+                .iter()
+                .any(|preset| preset.model == bundled_slug_not_in_endpoint),
+            "github-copilot model list should come from endpoint ids, not bundled catalog"
         );
     }
 

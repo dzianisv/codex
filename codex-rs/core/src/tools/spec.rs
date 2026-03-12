@@ -1523,6 +1523,19 @@ fn create_js_repl_reset_tool() -> ToolSpec {
     })
 }
 
+fn create_reload_mcp_servers_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "reload_mcp_servers".to_string(),
+        description: "Reload MCP server configuration from config.toml and reconnect active MCP sessions immediately. Use this after MCP-related config changes or when MCP tools become unresponsive.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -1839,6 +1852,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::MultiAgentHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
+    use crate::tools::handlers::ReloadMcpServersHandler;
     use crate::tools::handlers::RequestPermissionsHandler;
     use crate::tools::handlers::RequestUserInputHandler;
     use crate::tools::handlers::SearchToolBm25Handler;
@@ -1859,6 +1873,7 @@ pub(crate) fn build_specs(
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
+    let reload_mcp_servers_handler = Arc::new(ReloadMcpServersHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler::from(config.shell_command_backend));
     let request_permissions_handler = Arc::new(RequestPermissionsHandler);
     let request_user_input_handler = Arc::new(RequestUserInputHandler {
@@ -1919,6 +1934,8 @@ pub(crate) fn build_specs(
 
     builder.push_spec(PLAN_TOOL.clone());
     builder.register_handler("update_plan", plan_handler);
+    builder.push_spec(create_reload_mcp_servers_tool());
+    builder.register_handler("reload_mcp_servers", reload_mcp_servers_handler);
 
     if config.js_repl_enabled {
         builder.push_spec(create_js_repl_tool());
@@ -2309,6 +2326,7 @@ mod tests {
             create_exec_command_tool(true, false),
             create_write_stdin_tool(),
             PLAN_TOOL.clone(),
+            create_reload_mcp_servers_tool(),
             create_request_user_input_tool(CollaborationModesConfig::default()),
             create_apply_patch_freeform_tool(),
             ToolSpec::WebSearch {
@@ -2869,6 +2887,7 @@ mod tests {
             "shell_command",
             &[
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -2887,6 +2906,7 @@ mod tests {
             "shell_command",
             &[
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -2907,6 +2927,7 @@ mod tests {
                 "exec_command",
                 "write_stdin",
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -2927,6 +2948,7 @@ mod tests {
                 "exec_command",
                 "write_stdin",
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -2945,6 +2967,7 @@ mod tests {
             "shell_command",
             &[
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -2963,6 +2986,7 @@ mod tests {
             "shell_command",
             &[
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -2981,6 +3005,7 @@ mod tests {
             "shell",
             &[
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "web_search",
                 "view_image",
@@ -2998,6 +3023,7 @@ mod tests {
             "shell_command",
             &[
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -3018,6 +3044,7 @@ mod tests {
                 "exec_command",
                 "write_stdin",
                 "update_plan",
+                "reload_mcp_servers",
                 "request_user_input",
                 "apply_patch",
                 "web_search",
@@ -3041,7 +3068,12 @@ mod tests {
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
 
         // Only check the shell variant and a couple of core tools.
-        let mut subset = vec!["exec_command", "write_stdin", "update_plan"];
+        let mut subset = vec![
+            "exec_command",
+            "write_stdin",
+            "update_plan",
+            "reload_mcp_servers",
+        ];
         if let Some(shell_tool) = shell_tool_name(&tools_config) {
             subset.push(shell_tool);
         }

@@ -118,7 +118,6 @@ use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::ListCustomPromptsResponseEvent;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpListToolsResponseEvent;
-use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::McpStartupCompleteEvent;
 use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
@@ -4362,11 +4361,11 @@ impl ChatWidget {
                     "list" | "status" => {
                         self.add_mcp_output();
                     }
-                    "restart" | "refresh" | "reset" => {
-                        self.refresh_mcp_servers();
+                    "reload" | "restart" | "refresh" | "reset" => {
+                        self.reload_mcp_servers();
                     }
                     _ => {
-                        self.add_error_message("Usage: /mcp [list|status|restart]".to_string());
+                        self.add_error_message("Usage: /mcp [list|status|reload]".to_string());
                     }
                 }
             }
@@ -6220,12 +6219,15 @@ impl ChatWidget {
                     provider_id.clone(),
                     apply_runtime_selection,
                 );
+                let label = Self::provider_model_label(provider_id.as_str(), model.as_str());
+                let search_value = format!("{label} {}", model_preset.display_name);
                 SelectionItem {
-                    name: Self::provider_model_label(provider_id.as_str(), model.as_str()),
+                    name: label,
                     description,
                     is_current: provider_id == current_provider_id
                         && model.as_str() == current_model,
                     is_default: model_preset.is_default,
+                    search_value: Some(search_value),
                     actions,
                     dismiss_on_select: true,
                     ..Default::default()
@@ -6235,6 +6237,15 @@ impl ChatWidget {
 
         if !other_presets.is_empty() {
             let all_models = other_presets;
+            let mut all_models_search_value = String::from("all models");
+            for provider_preset in &all_models {
+                let label = Self::provider_model_label(
+                    provider_preset.provider_id.as_str(),
+                    provider_preset.model.model.as_str(),
+                );
+                all_models_search_value.push(' ');
+                all_models_search_value.push_str(label.as_str());
+            }
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 tx.send(AppEvent::OpenAllModelsPopup {
                     models: all_models.clone(),
@@ -6250,6 +6261,7 @@ impl ChatWidget {
                 name: "All models".to_string(),
                 description,
                 is_current,
+                search_value: Some(all_models_search_value),
                 actions,
                 dismiss_on_select: true,
                 ..Default::default()
@@ -6264,6 +6276,8 @@ impl ChatWidget {
             footer_hint: Some(standard_popup_hint_line()),
             items,
             header,
+            is_searchable: true,
+            search_placeholder: Some("Type to search models".to_string()),
             ..Default::default()
         });
     }
@@ -6312,11 +6326,13 @@ impl ChatWidget {
                     model: preset_for_event,
                 });
             })];
+            let label = Self::provider_model_label(provider_id.as_str(), preset.model.as_str());
             items.push(SelectionItem {
-                name: Self::provider_model_label(provider_id.as_str(), preset.model.as_str()),
+                name: label.clone(),
                 description,
                 is_current,
                 is_default: preset.is_default,
+                search_value: Some(format!("{label} {}", preset.display_name)),
                 actions,
                 dismiss_on_select: single_supported_effort,
                 ..Default::default()
@@ -6331,6 +6347,8 @@ impl ChatWidget {
             footer_hint: Some("Press enter to select reasoning effort, or esc to dismiss.".into()),
             items,
             header,
+            is_searchable: true,
+            search_placeholder: Some("Type to search models".to_string()),
             ..Default::default()
         });
     }
@@ -7993,43 +8011,11 @@ impl ChatWidget {
         }
     }
 
-    fn refresh_mcp_servers(&mut self) {
-        let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
-            self.config.codex_home.clone(),
-        )));
-        let configured_servers = mcp_manager.configured_servers(&self.config);
-        if configured_servers.is_empty() {
-            self.add_to_history(history_cell::empty_mcp_output());
-            return;
-        }
-
-        let mcp_servers = match serde_json::to_value(configured_servers) {
-            Ok(value) => value,
-            Err(err) => {
-                self.add_error_message(format!("Failed to serialize MCP servers: {err}"));
-                return;
-            }
-        };
-        let mcp_oauth_credentials_store_mode =
-            match serde_json::to_value(self.config.mcp_oauth_credentials_store_mode) {
-                Ok(value) => value,
-                Err(err) => {
-                    self.add_error_message(format!(
-                        "Failed to serialize MCP OAuth credentials store mode: {err}"
-                    ));
-                    return;
-                }
-            };
-
-        if self.submit_op(Op::RefreshMcpServers {
-            config: McpServerRefreshConfig {
-                mcp_servers,
-                mcp_oauth_credentials_store_mode,
-            },
-        }) {
+    fn reload_mcp_servers(&mut self) {
+        if self.submit_op(Op::ReloadMcpServers) {
             self.add_info_message(
-                "Queued MCP server refresh.".to_string(),
-                Some("MCP servers reconnect on the next active turn.".to_string()),
+                "Reloading MCP servers.".to_string(),
+                Some("Codex is re-reading config.toml and reconnecting now.".to_string()),
             );
         }
     }
