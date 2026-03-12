@@ -42,6 +42,14 @@ AGENTS.override.md
 .jest/
 *.tsbuildinfo
 
+# local codex memory sqlite artifacts
+.codex/memory/index.sqlite
+.codex/memory/index.sqlite-shm
+.codex/memory/index.sqlite-wal
+codex-cli/.codex/memory/index.sqlite
+codex-cli/.codex/memory/index.sqlite-shm
+codex-cli/.codex/memory/index.sqlite-wal
+
 # logs
 *.log
 npm-debug.log*
@@ -90,4 +98,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-

@@ -2121,6 +2121,21 @@ SOURCE: /[\s\S]+/
     })
 }
 
+fn create_reload_mcp_servers_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "reload_mcp_servers".to_string(),
+        description: "Reload MCP server configuration from config.toml and reconnect active MCP sessions immediately. Use this after MCP-related config changes or when MCP tools become unresponsive.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -2524,6 +2539,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
+    use crate::tools::handlers::ReloadMcpServersHandler;
     use crate::tools::handlers::RequestPermissionsHandler;
     use crate::tools::handlers::RequestUserInputHandler;
     use crate::tools::handlers::ShellCommandHandler;
@@ -2550,6 +2566,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
+    let reload_mcp_servers_handler = Arc::new(ReloadMcpServersHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler::from(config.shell_command_backend));
     let request_permissions_handler = Arc::new(RequestPermissionsHandler);
     let request_user_input_handler = Arc::new(RequestUserInputHandler {
@@ -2695,6 +2712,8 @@ pub(crate) fn build_specs_with_discoverable_tools(
         config.code_mode_enabled,
     );
     builder.register_handler("update_plan", plan_handler);
+    builder.push_spec(create_reload_mcp_servers_tool());
+    builder.register_handler("reload_mcp_servers", reload_mcp_servers_handler);
 
     if config.js_repl_enabled {
         push_tool_spec(

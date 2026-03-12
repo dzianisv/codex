@@ -273,3 +273,23 @@ async fn new_uses_active_github_copilot_provider_for_model_refresh() {
         "expected Copilot provider refresh to populate the selected model"
     );
 }
+
+#[tokio::test]
+async fn reload_mcp_servers_submits_reload_op_to_each_thread() {
+    let manager = ThreadManager::with_models_provider_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        crate::built_in_model_providers(None)["openai"].clone(),
+    );
+    let config = crate::config::test_config();
+    let new_thread = manager
+        .start_thread(config)
+        .await
+        .expect("start test thread");
+
+    manager.reload_mcp_servers().await;
+
+    assert_eq!(
+        manager.captured_ops(),
+        vec![(new_thread.thread_id, Op::ReloadMcpServers)]
+    );
+}

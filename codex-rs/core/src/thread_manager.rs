@@ -314,22 +314,28 @@ impl ThreadManager {
     }
 
     pub async fn refresh_mcp_servers(&self, refresh_config: McpServerRefreshConfig) {
-        let threads = self
-            .state
-            .threads
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for thread in threads {
-            if let Err(err) = thread
-                .submit(Op::RefreshMcpServers {
-                    config: refresh_config.clone(),
-                })
+        let thread_ids = self.state.list_thread_ids().await;
+        for thread_id in thread_ids {
+            if let Err(err) = self
+                .state
+                .send_op(
+                    thread_id,
+                    Op::RefreshMcpServers {
+                        config: refresh_config.clone(),
+                    },
+                )
                 .await
             {
                 warn!("failed to request MCP server refresh: {err}");
+            }
+        }
+    }
+
+    pub async fn reload_mcp_servers(&self) {
+        let thread_ids = self.state.list_thread_ids().await;
+        for thread_id in thread_ids {
+            if let Err(err) = self.state.send_op(thread_id, Op::ReloadMcpServers).await {
+                warn!("failed to request MCP server reload: {err}");
             }
         }
     }

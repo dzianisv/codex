@@ -23,8 +23,6 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
-use codex_core::config::types::McpServerConfig;
-use codex_core::config::types::McpServerTransportConfig;
 use codex_core::config::types::Notifications;
 #[cfg(target_os = "windows")]
 use codex_core::config::types::WindowsSandboxModeToml;
@@ -7644,39 +7642,21 @@ async fn model_slash_command_requests_open_model_popup_event() {
 }
 
 #[tokio::test]
-async fn mcp_slash_command_with_restart_args_submits_refresh_op() {
+async fn mcp_slash_command_with_reload_args_submits_reload_op() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
-    chat.config
-        .mcp_servers
-        .set(HashMap::from([(
-            "docs".to_string(),
-            McpServerConfig {
-                transport: McpServerTransportConfig::Stdio {
-                    command: "echo".to_string(),
-                    args: vec!["ok".to_string()],
-                    env: None,
-                    env_vars: Vec::new(),
-                    cwd: None,
-                },
-                enabled: true,
-                required: false,
-                disabled_reason: None,
-                startup_timeout_sec: None,
-                tool_timeout_sec: None,
-                enabled_tools: None,
-                disabled_tools: None,
-                scopes: None,
-                oauth_resource: None,
-            },
-        )]))
-        .expect("set test MCP server");
+
+    chat.dispatch_command_with_args(SlashCommand::Mcp, "reload".to_string(), Vec::new());
+
+    assert_matches!(op_rx.try_recv(), Ok(Op::ReloadMcpServers));
+}
+
+#[tokio::test]
+async fn mcp_slash_command_with_restart_alias_submits_reload_op() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
 
     chat.dispatch_command_with_args(SlashCommand::Mcp, "restart".to_string(), Vec::new());
 
-    assert_matches!(
-        op_rx.try_recv(),
-        Ok(Op::RefreshMcpServers { config }) if config.mcp_servers["docs"]["command"] == "echo"
-    );
+    assert_matches!(op_rx.try_recv(), Ok(Op::ReloadMcpServers));
 }
 
 #[tokio::test]
@@ -8119,6 +8099,259 @@ async fn cross_provider_reasoning_selection_persists_provider_without_runtime_sw
             .iter()
             .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(_))),
         "did not expect in-session reasoning update for cross-provider selection; events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_switches_to_azure_model_and_back_without_runtime_switch() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let original_provider_id = chat.config.model_provider_id.clone();
+
+    let preset = |slug: &str| ModelPreset {
+        id: slug.to_string(),
+        model: slug.to_string(),
+        display_name: slug.to_string(),
+        description: format!("{slug} description"),
+        default_reasoning_effort: ReasoningEffortConfig::Medium,
+        supported_reasoning_efforts: vec![ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Medium,
+            description: "medium".to_string(),
+        }],
+        supports_personality: false,
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        availability_nux: None,
+        supported_in_api: true,
+        input_modalities: default_input_modalities(),
+    };
+
+    let azure_provider_id = "azure".to_string();
+    let azure_preset = preset("gpt-5.3-codex");
+    let original_preset = preset("gpt-5.3-codex");
+
+    chat.open_all_models_popup_with_provider_presets(vec![
+        ProviderModelPreset {
+            provider_id: azure_provider_id.clone(),
+            model: azure_preset.clone(),
+        },
+        ProviderModelPreset {
+            provider_id: original_provider_id.clone(),
+            model: original_preset.clone(),
+        },
+    ]);
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("azure/gpt-5.3-codex"),
+        "expected azure model to appear in /model picker, got:\n{popup}"
+    );
+    assert!(
+        popup.contains(format!("{original_provider_id}/gpt-5.3-codex").as_str()),
+        "expected original provider model to appear in /model picker, got:\n{popup}"
+    );
+
+    chat.open_reasoning_popup_for_provider(azure_provider_id.clone(), azure_preset.clone());
+
+    let switch_to_azure_events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        switch_to_azure_events.iter().any(|event| matches!(
+            event,
+            AppEvent::PersistModelSelection {
+                provider: Some(provider),
+                model,
+                effort: Some(ReasoningEffortConfig::Medium),
+            } if provider == "azure" && model == "gpt-5.3-codex"
+        )),
+        "expected persisted azure model selection; events: {switch_to_azure_events:?}"
+    );
+    assert!(
+        !switch_to_azure_events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateModel(_))),
+        "did not expect in-session model update for provider switch; events: {switch_to_azure_events:?}"
+    );
+    assert!(
+        !switch_to_azure_events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(_))),
+        "did not expect in-session reasoning update for provider switch; events: {switch_to_azure_events:?}"
+    );
+
+    // Simulate a new session after switching providers.
+    chat.config.model_provider_id = azure_provider_id;
+    chat.set_model("gpt-5.3-codex");
+    while rx.try_recv().is_ok() {}
+
+    chat.open_all_models_popup_with_provider_presets(vec![
+        ProviderModelPreset {
+            provider_id: original_provider_id.clone(),
+            model: original_preset.clone(),
+        },
+        ProviderModelPreset {
+            provider_id: "azure".to_string(),
+            model: azure_preset,
+        },
+    ]);
+    chat.open_reasoning_popup_for_provider(original_provider_id.clone(), original_preset);
+
+    let switch_back_events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        switch_back_events.iter().any(|event| matches!(
+            event,
+            AppEvent::PersistModelSelection {
+                provider: Some(provider),
+                model,
+                effort: Some(ReasoningEffortConfig::Medium),
+            } if provider == &original_provider_id && model == "gpt-5.3-codex"
+        )),
+        "expected persisted switch back to original provider; events: {switch_back_events:?}"
+    );
+    assert!(
+        !switch_back_events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateModel(_))),
+        "did not expect in-session model update when switching providers back; events: {switch_back_events:?}"
+    );
+    assert!(
+        !switch_back_events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(_))),
+        "did not expect in-session reasoning update when switching providers back; events: {switch_back_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_switches_from_gpt5_3_to_copilot_claude_without_runtime_switch() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    chat.config.model_provider_id = "azure".to_string();
+    chat.set_model("gpt-5.3-codex");
+
+    let preset = |slug: &str| ModelPreset {
+        id: slug.to_string(),
+        model: slug.to_string(),
+        display_name: slug.to_string(),
+        description: format!("{slug} description"),
+        default_reasoning_effort: ReasoningEffortConfig::Medium,
+        supported_reasoning_efforts: vec![ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Medium,
+            description: "medium".to_string(),
+        }],
+        supports_personality: false,
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        availability_nux: None,
+        supported_in_api: true,
+        input_modalities: default_input_modalities(),
+    };
+
+    let azure_provider_id = "azure".to_string();
+    let copilot_provider_id = "github-copilot".to_string();
+    let azure_preset = preset("gpt-5.3-codex");
+    let copilot_preset = preset("claude-opus-4.6");
+
+    while rx.try_recv().is_ok() {}
+
+    chat.open_all_models_popup_with_provider_presets(vec![
+        ProviderModelPreset {
+            provider_id: azure_provider_id,
+            model: azure_preset,
+        },
+        ProviderModelPreset {
+            provider_id: copilot_provider_id.clone(),
+            model: copilot_preset.clone(),
+        },
+    ]);
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("azure/gpt-5.3-codex"),
+        "expected azure model to appear in /model picker, got:\n{popup}"
+    );
+    assert!(
+        popup.contains("github-copilot/claude-opus-4.6"),
+        "expected Copilot Claude model to appear in /model picker, got:\n{popup}"
+    );
+
+    chat.open_reasoning_popup_for_provider(copilot_provider_id, copilot_preset);
+    let switch_events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+    assert!(
+        switch_events.iter().any(|event| matches!(
+            event,
+            AppEvent::PersistModelSelection {
+                provider: Some(provider),
+                model,
+                effort: Some(ReasoningEffortConfig::Medium),
+            } if provider == "github-copilot" && model == "claude-opus-4.6"
+        )),
+        "expected persisted Copilot Claude model selection; events: {switch_events:?}"
+    );
+    assert!(
+        !switch_events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateModel(_))),
+        "did not expect in-session model update for provider switch; events: {switch_events:?}"
+    );
+    assert!(
+        !switch_events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(_))),
+        "did not expect in-session reasoning update for provider switch; events: {switch_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_search_filters_to_realistic_copilot_claude_slug() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    chat.config.model_provider_id = "azure".to_string();
+    chat.set_model("gpt-5.3-codex");
+
+    let preset = |slug: &str| ModelPreset {
+        id: slug.to_string(),
+        model: slug.to_string(),
+        display_name: slug.to_string(),
+        description: format!("{slug} description"),
+        default_reasoning_effort: ReasoningEffortConfig::Medium,
+        supported_reasoning_efforts: vec![ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Medium,
+            description: "medium".to_string(),
+        }],
+        supports_personality: false,
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        availability_nux: None,
+        supported_in_api: true,
+        input_modalities: default_input_modalities(),
+    };
+
+    chat.open_all_models_popup_with_provider_presets(vec![
+        ProviderModelPreset {
+            provider_id: "azure".to_string(),
+            model: preset("gpt-5.3-codex"),
+        },
+        ProviderModelPreset {
+            provider_id: "github-copilot".to_string(),
+            model: preset("gpt-5.4"),
+        },
+        ProviderModelPreset {
+            provider_id: "github-copilot".to_string(),
+            model: preset("claude-opus-4.6"),
+        },
+    ]);
+
+    for key in "claude".chars() {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+    }
+    let popup = render_bottom_popup(&chat, 120);
+
+    assert!(
+        popup.contains("github-copilot/claude-opus-4.6"),
+        "expected search to keep Copilot Claude model visible, got:\n{popup}"
+    );
+    assert!(
+        !popup.contains("github-copilot/gpt-5.4"),
+        "expected search to filter out non-matching Copilot model, got:\n{popup}"
     );
 }
 

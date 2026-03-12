@@ -430,6 +430,9 @@ pub enum Op {
     /// Request MCP servers to reinitialize and refresh cached tool lists.
     RefreshMcpServers { config: McpServerRefreshConfig },
 
+    /// Reload MCP server config from disk and reconnect servers immediately.
+    ReloadMcpServers,
+
     /// Reload user config layer overrides for the active session.
     ///
     /// This updates runtime config-derived behavior (for example app
@@ -529,6 +532,7 @@ impl Op {
             Self::GetHistoryEntryRequest { .. } => "get_history_entry_request",
             Self::ListMcpTools => "list_mcp_tools",
             Self::RefreshMcpServers { .. } => "refresh_mcp_servers",
+            Self::ReloadMcpServers => "reload_mcp_servers",
             Self::ReloadUserConfig => "reload_user_config",
             Self::ListCustomPrompts => "list_custom_prompts",
             Self::ListSkills { .. } => "list_skills",
