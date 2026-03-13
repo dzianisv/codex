@@ -37,6 +37,7 @@ async fn model_picker_search_switches_and_persists_across_restarts() -> Result<(
         &repo_root,
         "gpt-5.3-codex",
         "claude",
+        None,
         HashMap::new(),
     )
     .await
@@ -54,6 +55,7 @@ async fn model_picker_search_switches_and_persists_across_restarts() -> Result<(
         &repo_root,
         "claude-opus-4.6",
         "gpt-5.3-codex",
+        None,
         HashMap::new(),
     )
     .await
@@ -101,6 +103,7 @@ async fn model_picker_ignores_openai_compat_models_disabled_for_picker() -> Resu
         &repo_root,
         "llama3.2:latest",
         "claude-opus-4.6",
+        None,
         env,
     )
     .await
@@ -148,6 +151,7 @@ async fn ollama_model_picker_uses_local_models_endpoint_and_switches() -> Result
         &repo_root,
         "llama3.2:latest",
         "qwen2.5-coder:7b",
+        None,
         env,
     )
     .await
@@ -160,6 +164,75 @@ async fn ollama_model_picker_uses_local_models_endpoint_and_switches() -> Result
             .iter()
             .any(|line| line.starts_with("GET /v1/models ")),
         "expected at least one GET /v1/models request, got: {requests:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn ollama_model_switch_then_prompt_uses_responses_api() -> Result<()> {
+    // run_codex_cli_with_filter() does not work on Windows due to PTY limitations.
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
+    let codex_home = tempdir_with_ollama_config(&repo_root, "llama3.2:latest")?;
+    let prompt = "When the first gpt model was released?";
+    let answer_text = "The first GPT model (GPT-1) was released in 2018.";
+    let (base_url, server) = spawn_ollama_models_and_responses_server(
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "llama3.2:latest", "object": "model"},
+                {"id": "qwen2.5-coder:7b", "object": "model"}
+            ]
+        }),
+        answer_text,
+    )?;
+
+    let mut env = HashMap::new();
+    env.insert("CODEX_OSS_BASE_URL".to_string(), base_url);
+
+    let output = run_codex_cli_with_filter(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        "llama3.2:latest",
+        "qwen2.5-coder:7b",
+        Some(prompt),
+        env,
+    )
+    .await
+    .context("switch model and run simple prompt against local responses API")?;
+    assert_model_and_provider_in_config(codex_home.path(), "qwen2.5-coder:7b", "ollama", &output)?;
+    anyhow::ensure!(
+        output.contains("2018"),
+        "expected answer to contain 2018, got output: {output}"
+    );
+
+    let requests = server.join().expect("model/responses server should join")?;
+    anyhow::ensure!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("GET /v1/models ")),
+        "expected GET /v1/models request; got requests: {requests:?}"
+    );
+    let responses_request = requests
+        .iter()
+        .find(|request| request.starts_with("POST /v1/responses "))
+        .context("missing POST /v1/responses request")?;
+    anyhow::ensure!(
+        responses_request.contains("\"model\":\"qwen2.5-coder:7b\""),
+        "expected switched model in /responses request body; request: {responses_request}"
+    );
+    anyhow::ensure!(
+        responses_request.contains(prompt),
+        "expected prompt text in /responses request body; request: {responses_request}"
     );
 
     Ok(())
@@ -340,6 +413,7 @@ async fn run_codex_cli_with_filter(
     cwd: &Path,
     startup_model_hint: &str,
     filter: &str,
+    prompt_after_switch: Option<&str>,
     extra_env: HashMap<String, String>,
 ) -> Result<String> {
     let mut env = HashMap::new();
@@ -377,6 +451,7 @@ async fn run_codex_cli_with_filter(
     let writer_for_input = writer_tx.clone();
     let (startup_ready_tx, mut startup_ready_rx) = watch::channel(false);
     let filter = filter.to_string();
+    let prompt_after_switch = prompt_after_switch.map(std::borrow::ToOwned::to_owned);
     let input_task = tokio::spawn(async move {
         // Wait for startup to finish before dispatching `/model`.
         let _ = timeout(Duration::from_secs(20), async {
@@ -398,6 +473,19 @@ async fn run_codex_cli_with_filter(
         type_text_with_stabilization(&writer_for_input, &filter).await;
         sleep(Duration::from_millis(120)).await;
         let _ = writer_for_input.send(vec![b'\r']).await;
+        if let Some(prompt) = prompt_after_switch {
+            sleep(Duration::from_millis(900)).await;
+            // Close any remaining model picker overlays before typing a prompt.
+            let _ = writer_for_input.send(vec![27]).await;
+            sleep(Duration::from_millis(250)).await;
+            let _ = writer_for_input.send(vec![27]).await;
+            sleep(Duration::from_millis(700)).await;
+            type_text_with_stabilization(&writer_for_input, &prompt).await;
+            sleep(Duration::from_millis(120)).await;
+            let _ = writer_for_input.send(vec![b'\r']).await;
+            // Allow the streamed assistant output to be rendered before exit.
+            sleep(Duration::from_millis(2500)).await;
+        }
         sleep(Duration::from_millis(2500)).await;
         for _ in 0..4 {
             let _ = writer_for_input.send(vec![3]).await;
@@ -464,6 +552,139 @@ fn find_codex_cli(cwd: &Path) -> Option<PathBuf> {
         return Some(fallback);
     }
     None
+}
+
+fn spawn_ollama_models_and_responses_server(
+    models_response_json: serde_json::Value,
+    answer_text: &str,
+) -> Result<(String, thread::JoinHandle<Result<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let models_response_body = models_response_json.to_string();
+    let answer_json = serde_json::to_string(answer_text)?;
+    let responses_sse = format!(
+        "event: response.created\n\
+data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-1\",\"model\":\"qwen2.5-coder:7b\"}}}}\n\n\
+event: response.output_item.done\n\
+data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{answer_json}}}]}}}}\n\n\
+event: response.completed\n\
+data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage\":{{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}}}}\n\n"
+    );
+    let handle = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .context("failed to set nonblocking listener")?;
+        let mut requests = Vec::new();
+        let hard_deadline = Instant::now() + Duration::from_secs(30);
+        let mut idle_deadline: Option<Instant> = None;
+        while Instant::now() < hard_deadline
+            && idle_deadline
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(true)
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .context("failed to set read timeout")?;
+
+                    let mut raw_request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                raw_request.extend_from_slice(&chunk[..bytes_read]);
+                                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let header_end = raw_request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                        .context("HTTP headers terminator not found")?;
+                    let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_string();
+                    let request_line = headers
+                        .lines()
+                        .next()
+                        .context("missing request line")?
+                        .to_string();
+
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let lower = line.to_ascii_lowercase();
+                            lower
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+
+                    let mut body_bytes = raw_request[header_end..].to_vec();
+                    while body_bytes.len() < content_length {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => body_bytes.extend_from_slice(&chunk[..bytes_read]),
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let body = String::from_utf8_lossy(&body_bytes).to_string();
+                    requests.push(format!("{request_line}\n{body}"));
+
+                    let response = if request_line.starts_with("GET /v1/models ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            models_response_body.len(),
+                            models_response_body
+                        )
+                    } else if request_line.starts_with("POST /v1/responses ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            responses_sse.len(),
+                            responses_sse
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+
+                    stream
+                        .write_all(response.as_bytes())
+                        .context("failed to write test server response")?;
+                    stream
+                        .flush()
+                        .context("failed to flush test server response")?;
+
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(8));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(requests)
+    });
+
+    Ok((format!("http://{address}/v1"), handle))
 }
 
 async fn type_text_with_stabilization(writer: &tokio::sync::mpsc::Sender<Vec<u8>>, text: &str) {
