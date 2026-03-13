@@ -44,6 +44,8 @@ use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::GITHUB_COPILOT_PROVIDER_ID;
+use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
+use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -156,9 +158,13 @@ fn guardian_approvals_mode() -> GuardianApprovalsMode {
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
 
 fn startup_models_refresh_strategy(config: &Config) -> RefreshStrategy {
-    if config.model_provider_id == GITHUB_COPILOT_PROVIDER_ID {
-        // Copilot-only models come from the provider `/models` endpoint and
-        // are not present in bundled `models.json`.
+    if config.model_provider_id == GITHUB_COPILOT_PROVIDER_ID
+        || config.model_provider_id == OLLAMA_OSS_PROVIDER_ID
+        || config.model_provider_id == LMSTUDIO_OSS_PROVIDER_ID
+    {
+        // These providers expose authoritative `/models` endpoints:
+        // - Copilot: server-side model availability changes over time.
+        // - Ollama / LM Studio: installed local models can change at runtime.
         RefreshStrategy::OnlineIfUncached
     } else {
         RefreshStrategy::Offline
@@ -166,8 +172,13 @@ fn startup_models_refresh_strategy(config: &Config) -> RefreshStrategy {
 }
 
 fn model_picker_refresh_strategy(provider_id: &str) -> RefreshStrategy {
-    if provider_id == GITHUB_COPILOT_PROVIDER_ID {
-        // Keep Copilot list fresh in `/model` so newly supported models show up.
+    if provider_id == GITHUB_COPILOT_PROVIDER_ID
+        || provider_id == OLLAMA_OSS_PROVIDER_ID
+        || provider_id == LMSTUDIO_OSS_PROVIDER_ID
+    {
+        // Keep these lists fresh in `/model` so models show up:
+        // - Copilot: newly supported models appear server-side.
+        // - Ollama / LM Studio: user installs/removes models locally.
         RefreshStrategy::OnlineIfUncached
     } else {
         RefreshStrategy::Offline
@@ -4451,10 +4462,58 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn startup_model_refresh_fetches_remote_for_ollama() -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.model_provider_id = OLLAMA_OSS_PROVIDER_ID.to_string();
+
+        assert_eq!(
+            startup_models_refresh_strategy(&config),
+            RefreshStrategy::OnlineIfUncached
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_model_refresh_fetches_remote_for_lmstudio() -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.model_provider_id = LMSTUDIO_OSS_PROVIDER_ID.to_string();
+
+        assert_eq!(
+            startup_models_refresh_strategy(&config),
+            RefreshStrategy::OnlineIfUncached
+        );
+        Ok(())
+    }
+
     #[test]
     fn model_picker_refresh_fetches_remote_for_github_copilot() {
         assert_eq!(
             model_picker_refresh_strategy(GITHUB_COPILOT_PROVIDER_ID),
+            RefreshStrategy::OnlineIfUncached
+        );
+    }
+
+    #[test]
+    fn model_picker_refresh_fetches_remote_for_ollama() {
+        assert_eq!(
+            model_picker_refresh_strategy(OLLAMA_OSS_PROVIDER_ID),
+            RefreshStrategy::OnlineIfUncached
+        );
+    }
+
+    #[test]
+    fn model_picker_refresh_fetches_remote_for_lmstudio() {
+        assert_eq!(
+            model_picker_refresh_strategy(LMSTUDIO_OSS_PROVIDER_ID),
             RefreshStrategy::OnlineIfUncached
         );
     }

@@ -130,6 +130,14 @@ struct OpenAiCompatModelsResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiCompatModel {
     id: String,
+    #[serde(default)]
+    model_picker_enabled: Option<bool>,
+}
+
+impl OpenAiCompatModel {
+    fn is_picker_enabled(&self) -> bool {
+        !matches!(self.model_picker_enabled, Some(false))
+    }
 }
 
 /// Strategy for refreshing available models.
@@ -393,8 +401,13 @@ impl ModelsManager {
             return Ok(());
         }
 
+        // Providers that manage their own model catalog on the server side
+        // (Copilot, ChatGPT) or locally (Ollama, LM Studio) proceed to the
+        // standard refresh/fetch logic below.  All other providers only use
+        // the bundled catalog.
         if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt)
             && !self.provider.is_github_copilot_provider()
+            && !self.provider.is_local_oss_provider()
         {
             if matches!(
                 refresh_strategy,
@@ -464,57 +477,17 @@ impl ModelsManager {
                 .query(&[("client_version", client_version.clone())])
                 .headers(listing_headers)
                 .bearer_auth(token);
-            let response = timeout(MODELS_REFRESH_TIMEOUT, request.send())
-                .await
-                .map_err(|_| CodexErr::Timeout)?
-                .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
-            let etag = response
-                .headers()
-                .get(ETAG)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(CodexErr::Stream(
-                    format!(
-                        "failed to fetch models from github-copilot provider: {status}; body: {body}"
-                    ),
-                    None,
-                ));
-            }
-            let payload: OpenAiCompatModelsResponse = response
-                .json()
-                .await
-                .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
-            let mut seen = HashSet::new();
-            let bundled_models = Self::load_remote_models_from_file().unwrap_or_default();
-            let models = payload
-                .data
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, model)| {
-                    if !seen.insert(model.id.clone()) {
-                        return None;
-                    }
-
-                    let mut candidate = bundled_models
-                        .iter()
-                        .find(|bundled| bundled.slug == model.id)
-                        .cloned()
-                        .unwrap_or_else(|| model_info::model_info_from_slug(&model.id));
-                    candidate.slug = model.id.clone();
-                    if candidate.display_name.is_empty() {
-                        candidate.display_name = model.id;
-                    }
-                    candidate.visibility = ModelVisibility::List;
-                    candidate.supported_in_api = true;
-                    candidate.priority = i32::try_from(index).unwrap_or(i32::MAX);
-                    candidate.used_fallback_model_metadata = false;
-                    Some(candidate)
-                })
-                .collect::<Vec<_>>();
-            (models, etag)
+            self.fetch_openai_compat_models(request, "github-copilot")
+                .await?
+        } else if self.provider.is_local_oss_provider() {
+            // Local OSS providers (Ollama, LM Studio) expose an
+            // OpenAI-compatible `/v1/models` endpoint that returns the same
+            // `{ "data": [{ "id": "..." }] }` format as Copilot.  No auth
+            // is required.
+            let url = format!("{}/models", api_provider.base_url.trim_end_matches('/'));
+            let request = build_reqwest_client().get(url);
+            self.fetch_openai_compat_models(request, "local-oss")
+                .await?
         } else {
             let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
             let transport = ReqwestTransport::new(build_reqwest_client());
@@ -544,16 +517,84 @@ impl ModelsManager {
         Ok(())
     }
 
+    /// Send a GET request that returns an OpenAI-compatible models response
+    /// (`{ "data": [{ "id": "..." }, ...] }`) and convert the entries into
+    /// [`ModelInfo`] values.  Used for both GitHub Copilot and local OSS
+    /// providers (Ollama / LM Studio).
+    async fn fetch_openai_compat_models(
+        &self,
+        request: reqwest::RequestBuilder,
+        provider_label: &str,
+    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        let response = timeout(MODELS_REFRESH_TIMEOUT, request.send())
+            .await
+            .map_err(|_| CodexErr::Timeout)?
+            .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(CodexErr::Stream(
+                format!(
+                    "failed to fetch models from {provider_label} provider: {status}; body: {body}"
+                ),
+                None,
+            ));
+        }
+        let payload: OpenAiCompatModelsResponse = response
+            .json()
+            .await
+            .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        let mut seen = HashSet::new();
+        let bundled_models = Self::load_remote_models_from_file().unwrap_or_default();
+        let models = payload
+            .data
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, model)| {
+                if !model.is_picker_enabled() {
+                    return None;
+                }
+                if !seen.insert(model.id.clone()) {
+                    return None;
+                }
+
+                let mut candidate = bundled_models
+                    .iter()
+                    .find(|bundled| bundled.slug == model.id)
+                    .cloned()
+                    .unwrap_or_else(|| model_info::model_info_from_slug(&model.id));
+                candidate.slug = model.id.clone();
+                if candidate.display_name.is_empty() {
+                    candidate.display_name = model.id;
+                }
+                candidate.visibility = ModelVisibility::List;
+                candidate.supported_in_api = true;
+                candidate.priority = i32::try_from(index).unwrap_or(i32::MAX);
+                candidate.used_fallback_model_metadata = false;
+                Some(candidate)
+            })
+            .collect::<Vec<_>>();
+        Ok((models, etag))
+    }
+
     async fn get_etag(&self) -> Option<String> {
         self.etag.read().await.clone()
     }
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
-        let next_models = if self.provider.is_github_copilot_provider() {
-            // The Copilot `/models` endpoint is OpenAI-compat and returns only model ids.
-            // We already enrich each id with bundled/fallback metadata in `fetch_and_update_models`.
-            // Keep exactly that endpoint list here so picker availability is not hardcoded.
+        let next_models = if self.provider.is_github_copilot_provider()
+            || self.provider.is_local_oss_provider()
+        {
+            // Copilot and local OSS providers return their own definitive
+            // model list via an OpenAI-compat endpoint.  Use that list
+            // as-is instead of merging with the bundled models.json
+            // (which only contains OpenAI models).
             models
         } else {
             let mut existing_models = Self::load_remote_models_from_file().unwrap_or_default();
@@ -1444,6 +1485,54 @@ mod tests;
         }
     }
 
+    #[tokio::test]
+    async fn copilot_models_excludes_entries_disabled_for_picker() {
+        let server = MockServer::start().await;
+        let _models_mock = wiremock::Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer copilot-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": "gpt-5.1", "model_picker_enabled": true},
+                    {"id": "claude-opus-4.6", "model_picker_enabled": false}
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.base_url = Some(server.uri());
+        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::Online)
+            .await
+            .expect("copilot refresh should succeed");
+
+        let available = manager
+            .try_list_models()
+            .expect("models should be available");
+        assert!(
+            available.iter().any(|preset| preset.model == "gpt-5.1"),
+            "expected picker-enabled model to be listed"
+        );
+        assert!(
+            !available
+                .iter()
+                .any(|preset| preset.model == "claude-opus-4.6"),
+            "model_picker_enabled=false entries must not be listed"
+        );
+    }
+
     #[test]
     fn build_available_models_picks_default_after_hiding_hidden_models() {
         let codex_home = tempdir().expect("temp dir");
@@ -1486,6 +1575,75 @@ mod tests;
         assert!(
             !response.models.is_empty(),
             "bundled models.json should contain at least one model"
+        );
+    }
+
+    /// Verify that OSS providers (Ollama / LM Studio) fetch models from
+    /// their local `/v1/models` endpoint using the OpenAI-compatible format
+    /// and that only the server-returned models appear (no bundled GPT
+    /// models mixed in).
+    #[tokio::test]
+    async fn oss_provider_fetches_models_from_local_server() {
+        let server = MockServer::start().await;
+
+        // Ollama's /v1/models returns the OpenAI-compat format.
+        let _mock = wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "smollm2:135m", "object": "model", "created": 1234567890, "owned_by": "library"},
+                    {"id": "llama3.2:latest", "object": "model", "created": 1234567891, "owned_by": "library"},
+                    {"id": "qwen2.5-coder:7b", "object": "model", "created": 1234567892, "owned_by": "library"},
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+        let provider = crate::model_provider_info::create_oss_provider_with_base_url(
+            &format!("{}/v1", server.uri()),
+            WireApi::Responses,
+        );
+        assert!(
+            provider.is_local_oss_provider(),
+            "test provider should be detected as local OSS"
+        );
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("OSS refresh should succeed");
+
+        let available = manager
+            .try_list_models()
+            .expect("models should be available");
+
+        // All three Ollama models should be present.
+        let expected = ["smollm2:135m", "llama3.2:latest", "qwen2.5-coder:7b"];
+        for model in &expected {
+            assert!(
+                available.iter().any(|preset| preset.model == *model),
+                "expected {model} in picker but got: {:?}",
+                available.iter().map(|p| &p.model).collect::<Vec<_>>()
+            );
+        }
+
+        // Bundled GPT models should NOT appear (OSS providers replace the
+        // entire list with the server response).
+        assert!(
+            !available
+                .iter()
+                .any(|preset| preset.model.starts_with("gpt-")),
+            "bundled GPT models should not appear for OSS providers; got: {:?}",
+            available.iter().map(|p| &p.model).collect::<Vec<_>>()
         );
     }
 }

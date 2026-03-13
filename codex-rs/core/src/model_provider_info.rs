@@ -31,6 +31,7 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 const GITHUB_COPILOT_PROVIDER_NAME: &str = "GitHub Copilot";
+const OSS_PROVIDER_NAME: &str = "gpt-oss";
 const GITHUB_COPILOT_TOKEN_ENV_KEY: &str = "GITHUB_COPILOT_TOKEN";
 const GITHUB_COPILOT_TOKEN_INSTRUCTIONS: &str =
     "Set GITHUB_COPILOT_TOKEN to a valid GitHub Copilot bearer token before starting Codex.";
@@ -136,6 +137,12 @@ pub struct ModelProviderInfo {
 impl ModelProviderInfo {
     pub(crate) fn is_github_copilot_provider(&self) -> bool {
         self.name == GITHUB_COPILOT_PROVIDER_NAME
+    }
+
+    /// Returns `true` when this provider targets a local OSS server
+    /// (Ollama or LM Studio) that does not require authentication.
+    pub(crate) fn is_local_oss_provider(&self) -> bool {
+        self.name == OSS_PROVIDER_NAME && self.env_key.is_none()
     }
 
     fn build_header_map(&self) -> crate::error::Result<HeaderMap> {
@@ -372,7 +379,7 @@ pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> Mod
 
 pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> ModelProviderInfo {
     ModelProviderInfo {
-        name: "gpt-oss".into(),
+        name: OSS_PROVIDER_NAME.into(),
         base_url: Some(base_url.into()),
         env_key: None,
         env_key_instructions: None,
