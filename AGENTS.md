@@ -114,6 +114,13 @@ If you don’t have the tool:
 - Prefer deep equals comparisons whenever possible. Perform `assert_eq!()` on entire objects, rather than individual fields.
 - Avoid mutating process environment in tests; prefer passing environment-derived flags or dependencies from above.
 
+### Real CLI end-to-end validation (mandatory)
+
+- Do not mark a feature/bugfix task complete until at least one automated end-to-end test against the real `codex` binary passes.
+- Unit tests alone are not sufficient when user-visible behavior is changed.
+- The E2E test must exercise the actual user workflow through CLI/TUI input handling (for example PTY-driven command entry), not only direct internal API calls.
+- For model-switching changes, the E2E path must include `/model` selection and then a real prompt submission in the same session, with assertions on the outbound model used by `/responses`.
+
 ### Spawning workspace binaries in tests (Cargo vs Bazel)
 
 - Prefer `codex_utils_cargo_bin::cargo_bin("...")` over `assert_cmd::Command::cargo_bin(...)` or `escargot` when tests need to spawn first-party binaries.
