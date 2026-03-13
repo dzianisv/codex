@@ -184,7 +184,7 @@ async fn ollama_model_switch_then_prompt_uses_responses_api() -> Result<()> {
     let codex_home = tempdir_with_ollama_config(&repo_root, "llama3.2:latest")?;
     let prompt = "When the first gpt model was released?";
     let answer_text = "The first GPT model (GPT-1) was released in 2018.";
-    let (base_url, server) = spawn_ollama_models_and_responses_server(
+    let (base_url, server) = spawn_openai_compat_models_and_responses_server(
         serde_json::json!({
             "object": "list",
             "data": [
@@ -192,6 +192,7 @@ async fn ollama_model_switch_then_prompt_uses_responses_api() -> Result<()> {
                 {"id": "qwen2.5-coder:7b", "object": "model"}
             ]
         }),
+        "qwen2.5-coder:7b",
         answer_text,
     )?;
 
@@ -228,6 +229,89 @@ async fn ollama_model_switch_then_prompt_uses_responses_api() -> Result<()> {
         .context("missing POST /v1/responses request")?;
     anyhow::ensure!(
         responses_request.contains("\"model\":\"qwen2.5-coder:7b\""),
+        "expected switched model in /responses request body; request: {responses_request}"
+    );
+    anyhow::ensure!(
+        responses_request.contains(prompt),
+        "expected prompt text in /responses request body; request: {responses_request}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provider_override()
+-> Result<()> {
+    // run_codex_cli_with_filter() does not work on Windows due to PTY limitations.
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
+    let prompt = "When the first gpt model was released?";
+    let answer_text = "The first GPT model (GPT-1) was released in June 2018.";
+    let (base_url, server) = spawn_openai_compat_models_and_responses_server(
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "copilot-test-a",
+                    "object": "model",
+                    "model_picker_enabled": true,
+                    "supported_endpoints": ["/responses"]
+                },
+                {
+                    "id": "copilot-test-b",
+                    "object": "model",
+                    "model_picker_enabled": true,
+                    "supported_endpoints": ["/responses"]
+                }
+            ]
+        }),
+        "copilot-test-b",
+        answer_text,
+    )?;
+    let codex_home = tempdir_with_local_copilot_config(
+        &repo_root,
+        "copilot-test-a",
+        base_url.as_str(),
+        &["copilot-test-a", "copilot-test-b"],
+    )?;
+
+    let mut env = HashMap::new();
+    env.insert(
+        "COPILOT_TEST_KEY".to_string(),
+        "test-copilot-token".to_string(),
+    );
+    let output = run_codex_cli_with_filter(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        "copilot-test-a",
+        "copilot-test-b",
+        Some(prompt),
+        env,
+    )
+    .await
+    .context("switch model via /model and run prompt against local Copilot responses API")?;
+    assert_model_and_provider_in_config(
+        codex_home.path(),
+        "copilot-test-b",
+        "copilot-local",
+        &output,
+    )?;
+
+    let requests = server.join().expect("model/responses server should join")?;
+    let responses_request = requests
+        .iter()
+        .find(|request| request.starts_with("POST /v1/responses "))
+        .context("missing POST /v1/responses request")?;
+    anyhow::ensure!(
+        responses_request.contains("\"model\":\"copilot-test-b\""),
         "expected switched model in /responses request body; request: {responses_request}"
     );
     anyhow::ensure!(
@@ -283,6 +367,58 @@ fn tempdir_with_ollama_config(repo_root: &Path, model: &str) -> Result<TempDir> 
     let config_contents = format!(
         r#"model_provider = "ollama"
 model = "{model}"
+
+[projects."{repo_root_display}"]
+trust_level = "trusted"
+"#
+    );
+    std::fs::write(codex_home.path().join("config.toml"), config_contents)?;
+
+    Ok(codex_home)
+}
+
+fn tempdir_with_local_copilot_config(
+    repo_root: &Path,
+    model: &str,
+    base_url: &str,
+    catalog_models: &[&str],
+) -> Result<TempDir> {
+    let codex_home = tempfile::tempdir()?;
+
+    let source_catalog_path = codex_utils_cargo_bin::find_resource!("../core/models.json")?;
+    let source_catalog = std::fs::read_to_string(&source_catalog_path)?;
+    let mut source_catalog: JsonValue = serde_json::from_str(&source_catalog)?;
+    let models = source_catalog
+        .get_mut("models")
+        .and_then(JsonValue::as_array_mut)
+        .context("models array missing")?;
+    let template = models.first().cloned().context("models array is empty")?;
+    *models = catalog_models
+        .iter()
+        .enumerate()
+        .map(|(index, catalog_model)| {
+            model_from_template(&template, catalog_model, catalog_model, index as i64)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let custom_catalog_path = codex_home.path().join("catalog.json");
+    std::fs::write(
+        &custom_catalog_path,
+        serde_json::to_string(&source_catalog)?,
+    )?;
+
+    let repo_root_display = repo_root.display();
+    let catalog_display = custom_catalog_path.display();
+    let config_contents = format!(
+        r#"model_provider = "copilot-local"
+model = "{model}"
+model_catalog_json = "{catalog_display}"
+
+[model_providers.copilot-local]
+name = "GitHub Copilot"
+base_url = "{base_url}"
+env_key = "COPILOT_TEST_KEY"
+wire_api = "responses"
 
 [projects."{repo_root_display}"]
 trust_level = "trusted"
@@ -474,10 +610,8 @@ async fn run_codex_cli_with_filter(
         sleep(Duration::from_millis(120)).await;
         let _ = writer_for_input.send(vec![b'\r']).await;
         if let Some(prompt) = prompt_after_switch {
+            // Allow model/effort selection to settle and close the picker before prompt input.
             sleep(Duration::from_millis(900)).await;
-            // Close any remaining model picker overlays before typing a prompt.
-            let _ = writer_for_input.send(vec![27]).await;
-            sleep(Duration::from_millis(250)).await;
             let _ = writer_for_input.send(vec![27]).await;
             sleep(Duration::from_millis(700)).await;
             type_text_with_stabilization(&writer_for_input, &prompt).await;
@@ -501,15 +635,19 @@ async fn run_codex_cli_with_filter(
                         if chunk.windows(4).any(|window| window == b"\x1b[6n") {
                             let _ = writer_tx.send(b"\x1b[1;1R".to_vec()).await;
                         }
-                        if !startup_model_hint.is_empty()
-                            && !*startup_ready_tx.borrow()
-                            && chunk
-                                .windows(startup_model_hint.len())
-                                .any(|window| window == startup_model_hint.as_bytes())
-                        {
-                            let _ = startup_ready_tx.send(true);
-                        }
                         output.extend_from_slice(&chunk);
+                        if !*startup_ready_tx.borrow() {
+                            let startup_ready = if startup_model_hint.is_empty() {
+                                true
+                            } else {
+                                output
+                                    .windows(startup_model_hint.len())
+                                    .any(|window| window == startup_model_hint.as_bytes())
+                            };
+                            if startup_ready {
+                                let _ = startup_ready_tx.send(true);
+                            }
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break exit_rx.await,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -554,17 +692,19 @@ fn find_codex_cli(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-fn spawn_ollama_models_and_responses_server(
+fn spawn_openai_compat_models_and_responses_server(
     models_response_json: serde_json::Value,
+    response_model: &str,
     answer_text: &str,
 ) -> Result<(String, thread::JoinHandle<Result<Vec<String>>>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let models_response_body = models_response_json.to_string();
+    let response_model_json = serde_json::to_string(response_model)?;
     let answer_json = serde_json::to_string(answer_text)?;
     let responses_sse = format!(
         "event: response.created\n\
-data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-1\",\"model\":\"qwen2.5-coder:7b\"}}}}\n\n\
+data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-1\",\"model\":{response_model_json}}}}}\n\n\
 event: response.output_item.done\n\
 data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{answer_json}}}]}}}}\n\n\
 event: response.completed\n\
