@@ -1,25 +1,27 @@
 ---
 source: tui/src/chatwidget/tests.rs
+assertion_line: 7230
 expression: popup
 ---
   Select Model and Effort
   Access legacy models by running codex -m <model_name> or in your config.toml
 
-› 1. openai/gpt-5.3-codex (default)          Latest frontier agentic coding
-                                             model.
-  2. openai/gpt-5.4                          Latest frontier agentic coding
-                                             model.
-  3. openai/gpt-5.2-codex                    Frontier agentic coding model.
-  4. openai/gpt-5.1-codex-max                Codex-optimized flagship for deep
-                                             and fast reasoning.
-  5. openai/gpt-5.2                          Latest frontier model with
-                                             improvements across knowledge,
-                                             reasoning and coding
-  6. openai/gpt-5.1-codex-mini               Optimized for codex. Cheaper,
-                                             faster, but less capable.
-  7. github-copilot/gpt-5.3-codex (default)  Latest frontier agentic coding
-                                             model.
-  8. github-copilot/gpt-5.4                  Latest frontier agentic coding
-                                             model.
+  Type to search models
+› openai/gpt-5.3-codex (default)          Latest frontier agentic coding
+                                          model.
+  openai/gpt-5.4                          Latest frontier agentic coding
+                                          model.
+  openai/gpt-5.2-codex                    Frontier agentic coding model.
+  openai/gpt-5.1-codex-max                Codex-optimized flagship for deep
+                                          and fast reasoning.
+  openai/gpt-5.2                          Latest frontier model with
+                                          improvements across knowledge,
+                                          reasoning and coding
+  openai/gpt-5.1-codex-mini               Optimized for codex. Cheaper,
+                                          faster, but less capable.
+  github-copilot/gpt-5.3-codex (default)  Latest frontier agentic coding
+                                          model.
+  github-copilot/gpt-5.4                  Latest frontier agentic coding
+                                          model.
 
   Press enter to select reasoning effort, or esc to dismiss.

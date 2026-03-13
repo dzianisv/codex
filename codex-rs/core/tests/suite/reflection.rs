@@ -37,7 +37,7 @@ fn create_azure_config(base_url: &str, model: &str) -> String {
     let base_url = if base_url.ends_with("/openai") {
         base_url.to_string()
     } else {
-        format!("{}/openai", base_url)
+        format!("{base_url}/openai")
     };
 
     format!(
@@ -198,7 +198,7 @@ After creating both files, run the test to verify it passes."#;
     // Check that reflection layer was invoked by looking at both stdout and stderr (logs)
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
-    let combined_output = format!("{}{}", stdout_str, stderr_str);
+    let combined_output = format!("{stdout_str}{stderr_str}");
 
     let reflection_invoked = combined_output.contains("Running reflection evaluation")
         || combined_output.contains("Reflection verdict")
@@ -211,7 +211,7 @@ After creating both files, run the test to verify it passes."#;
         // Extract and print reflection verdict if present
         for line in combined_output.lines() {
             if line.contains("Reflection verdict") || line.contains("Reflection:") {
-                println!("  {}", line);
+                println!("  {line}");
             }
         }
     } else {
@@ -221,11 +221,11 @@ After creating both files, run the test to verify it passes."#;
 
     // Verify hello.py content is correct
     let hello_content = std::fs::read_to_string(&hello_path).unwrap();
-    println!("\n=== hello.py ===\n{}", hello_content);
+    println!("\n=== hello.py ===\n{hello_content}");
 
     // Verify test file content
     let test_content = std::fs::read_to_string(&test_path).unwrap();
-    println!("\n=== test_hello.py ===\n{}", test_content);
+    println!("\n=== test_hello.py ===\n{test_content}");
 
     // The reflection layer should have been invoked
     assert!(
@@ -255,12 +255,12 @@ fn reflection_config_azure_openai() {
     // Verify reflection was at least attempted (logs go to stderr)
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
-    let combined_output = format!("{}{}", stdout_str, stderr_str);
-    println!("Output:\n{}", combined_output);
+    let combined_output = format!("{stdout_str}{stderr_str}");
+    println!("Output:\n{combined_output}");
 
     // Should see reflection-related log messages
     let has_reflection_logs =
         combined_output.contains("reflection") || combined_output.contains("Reflection");
 
-    println!("\nReflection activity detected: {}", has_reflection_logs);
+    println!("\nReflection activity detected: {has_reflection_logs}");
 }

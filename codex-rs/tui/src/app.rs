@@ -2554,10 +2554,6 @@ impl App {
                 self.chat_widget
                     .open_plan_reasoning_scope_prompt(model, effort);
             }
-            AppEvent::OpenAllModelsPopup { models } => {
-                self.chat_widget
-                    .open_all_models_popup_with_provider_presets(models);
-            }
             AppEvent::OpenFullAccessConfirmation {
                 preset,
                 return_to_permissions,

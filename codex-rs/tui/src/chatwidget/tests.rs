@@ -7347,6 +7347,107 @@ async fn model_selection_popup_lists_github_copilot_remote_models() {
 }
 
 #[tokio::test]
+async fn model_popup_shows_all_copilot_subscription_models_including_gemini() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test /models server");
+    let addr = listener.local_addr().expect("models server address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept /models connection");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        // Respond with a realistic Copilot /models payload that includes
+        // auto models, GPT, Gemini, and Claude – the same mix a user with a
+        // full Copilot subscription would see.  The auto models trigger the
+        // "quick auto mode" partition in the picker; non-auto models must
+        // still be individually visible.
+        let response_body = serde_json::json!({
+            "data": [
+                {"id": "codex-auto-fast"},
+                {"id": "codex-auto-balanced"},
+                {"id": "gpt-5.3-codex"},
+                {"id": "gpt-5.2-codex"},
+                {"id": "gemini-2.5-pro"},
+                {"id": "gemini-2.5-flash"},
+                {"id": "claude-sonnet-4.5"},
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write /models response");
+    });
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    let mut provider = chat.config.model_provider.clone();
+    provider.name = "GitHub Copilot".to_string();
+    provider.base_url = Some(format!("http://{addr}"));
+    provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+    chat.config.model_provider = provider.clone();
+
+    chat.auth_manager = codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key(
+        "copilot-test-token",
+    ));
+    chat.models_manager = Arc::new(ModelsManager::new(
+        chat.config.codex_home.clone(),
+        chat.auth_manager.clone(),
+        None,
+        CollaborationModesConfig::default(),
+        provider,
+    ));
+    let refreshed = chat
+        .models_manager
+        .list_models(RefreshStrategy::Online)
+        .await;
+    server.join().expect("models server should complete");
+
+    // All seven models from the endpoint should be in the refreshed list.
+    for expected in &[
+        "codex-auto-fast",
+        "codex-auto-balanced",
+        "gpt-5.3-codex",
+        "gpt-5.2-codex",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "claude-sonnet-4.5",
+    ] {
+        assert!(
+            refreshed.iter().any(|p| p.model == *expected),
+            "expected {expected} in refreshed models list, got: {:?}",
+            refreshed.iter().map(|p| &p.model).collect::<Vec<_>>()
+        );
+    }
+
+    // Open /model and render the popup – every subscription model must be
+    // visible somewhere in the rendered output (either directly or under
+    // "All models").
+    chat.open_model_popup();
+    let popup = render_bottom_popup(&chat, 120);
+    for expected in &["gemini-2.5-pro", "gemini-2.5-flash", "claude-sonnet-4.5"] {
+        assert!(
+            popup.contains(expected),
+            "expected {expected} to be visible in /model popup, got:\n{popup}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn personality_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2-codex")).await;
     chat.thread_id = Some(ThreadId::new());
