@@ -36,7 +36,7 @@ fn create_config(base_url: &str, model: &str, reflection_enabled: bool) -> Strin
     let base_url = if base_url.ends_with("/openai") {
         base_url.to_string()
     } else {
-        format!("{}/openai", base_url)
+        format!("{base_url}/openai")
     };
 
     let reflection_config = if reflection_enabled {
@@ -179,7 +179,7 @@ fn run_eval_task(
     let reflection_verdicts: Vec<String> = combined
         .lines()
         .filter(|line| line.contains("Reflection verdict"))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     // Run the verification test
@@ -573,7 +573,7 @@ fn eval_summary() {
     let mut without_reflection_pass = 0;
 
     for (name, issue, files, test_cmd) in tasks.iter() {
-        println!("--- {} ---", name);
+        println!("--- {name} ---");
 
         // With reflection
         let result_with = run_eval_task(
@@ -627,6 +627,6 @@ fn eval_summary() {
     );
     println!(
         "Improvement: {:+} tasks",
-        with_reflection_pass as i32 - without_reflection_pass as i32
+        with_reflection_pass - without_reflection_pass
     );
 }

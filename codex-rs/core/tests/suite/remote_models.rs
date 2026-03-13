@@ -49,7 +49,11 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use wiremock::BodyPrintLimit;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const REMOTE_MODEL_SLUG: &str = "codex-test";
 
@@ -1023,4 +1027,111 @@ fn test_remote_model_with_policy(
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
     }
+}
+
+/// End-to-end integration test that exercises the full Codex startup pipeline
+/// with a GitHub Copilot provider. Verifies:
+/// 1. The `/models` request does NOT include the `Openai-Intent` header
+///    (which would cause the Copilot API to filter out non-GPT model families).
+/// 2. ALL model families (GPT, Claude, Gemini) returned by the mock API appear
+///    in the `ModelsManager` available model list.
+///
+/// This test uses `TestCodexBuilder` to spin up a real `ThreadManager` and
+/// session thread — the same code path the production binary uses — rather than
+/// isolated unit-test mocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copilot_provider_e2e_shows_all_model_families_without_openai_intent_filter() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = MockServer::start().await;
+
+    // Mount a copilot-format /models endpoint. The GitHub Copilot API returns
+    // { "data": [{ "id": "..." }, ...] } — NOT the ModelsResponse { models }
+    // format used by the bundled models.json. This is the real wire format that
+    // fetch_and_update_models() deserializes via OpenAiCompatModelsResponse.
+    Mock::given(method("GET"))
+        .and(path_regex(".*/models$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "gpt-5.3-codex"},
+                {"id": "gpt-5.1"},
+                {"id": "claude-sonnet-4.5"},
+                {"id": "gemini-2.5-pro"},
+                {"id": "gemini-2.5-flash"},
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    // Build a full Codex session using the GitHub Copilot provider pointed at
+    // our mock server. The config mutator replaces the default OpenAI provider
+    // with the production copilot provider (same code path as real binary).
+    let TestCodex { thread_manager, .. } = test_codex()
+        .with_config(|config| {
+            // Inherit base_url from the default provider (set by prepare_config
+            // to point at the mock server).
+            let base_url = config.model_provider.base_url.clone();
+            let mut provider = ModelProviderInfo::create_github_copilot_provider();
+            provider.base_url = base_url;
+            // Use a non-existent env key so auth falls through to the dummy
+            // API key token from test_codex()'s default auth.
+            provider.env_key = Some("__CODEX_TEST_COPILOT_KEY__".to_string());
+            config.model_provider = provider;
+            // Set a model from our mock response so the default test model
+            // catalog (CatalogMode::Custom) doesn't kick in — that would
+            // bypass network fetching entirely.
+            config.model = Some("gpt-5.3-codex".to_string());
+            config.model_catalog = None;
+        })
+        .build(&server)
+        .await?;
+
+    let models_manager = thread_manager.get_models_manager();
+
+    // Verify ALL expected models appear — GPT, Claude, AND Gemini families.
+    let available = models_manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await;
+
+    let expected_slugs = [
+        "gpt-5.3-codex",
+        "gpt-5.1",
+        "claude-sonnet-4.5",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+    ];
+    for slug in &expected_slugs {
+        assert!(
+            available.iter().any(|m| m.model == *slug),
+            "expected model {slug} not found in available models: {:?}",
+            available.iter().map(|m| &m.model).collect::<Vec<_>>()
+        );
+    }
+
+    // Verify the /models request did NOT include the Openai-Intent header.
+    // When this header is present, the Copilot API filters out model families
+    // that don't support the declared intent (e.g. Gemini models are excluded).
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server should have recorded requests");
+    let models_request = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/models"))
+        .expect("expected at least one GET /models request to the mock server");
+    assert!(
+        models_request.headers.get("openai-intent").is_none(),
+        "the /models request MUST NOT include the Openai-Intent header; \
+         including it causes the Copilot API to filter out model families \
+         like Gemini. Headers sent: {:?}",
+        models_request
+            .headers
+            .keys()
+            .map(reqwest::header::HeaderName::as_str)
+            .collect::<Vec<_>>()
+    );
+
+    Ok(())
 }

@@ -339,7 +339,7 @@ pub fn parse_verdict(response: &str) -> Result<ReflectionVerdict> {
             Ok(ReflectionVerdict {
                 completed: true,
                 confidence: 0.5,
-                reasoning: format!("Failed to parse judge response: {}", e),
+                reasoning: format!("Failed to parse judge response: {e}"),
                 feedback: None,
             })
         }
@@ -349,10 +349,10 @@ pub fn parse_verdict(response: &str) -> Result<ReflectionVerdict> {
 /// Extract JSON object from a string that might contain other text.
 fn extract_json(s: &str) -> String {
     // Find the first { and last }
-    if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}')) {
-        if end > start {
-            return s[start..=end].to_string();
-        }
+    if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}'))
+        && end > start
+    {
+        return s[start..=end].to_string();
     }
     s.to_string()
 }

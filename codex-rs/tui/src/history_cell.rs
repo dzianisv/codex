@@ -1765,7 +1765,7 @@ pub(crate) fn new_reflection_verdict(
             confidence * 100.0
         );
         lines.push(vec![header.green()].into());
-        lines.push(vec![format!("  {}", reasoning).dim()].into());
+        lines.push(vec![format!("  {reasoning}").dim()].into());
     } else {
         // Incomplete case - yellow warning
         let header = format!(
@@ -1775,9 +1775,9 @@ pub(crate) fn new_reflection_verdict(
             confidence * 100.0
         );
         lines.push(vec![header.yellow()].into());
-        lines.push(vec![format!("  Reasoning: {}", reasoning).dim()].into());
+        lines.push(vec![format!("  Reasoning: {reasoning}").dim()].into());
         if let Some(fb) = feedback {
-            lines.push(vec![format!("  Feedback: {}", fb).yellow()].into());
+            lines.push(vec![format!("  Feedback: {fb}").yellow()].into());
         }
     }
 

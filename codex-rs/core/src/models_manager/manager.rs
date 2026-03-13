@@ -453,10 +453,16 @@ impl ModelsManager {
             };
 
             let url = format!("{}/models", api_provider.base_url.trim_end_matches('/'));
+            // Strip the Openai-Intent header for the /models listing request.
+            // This header is intended for chat/completion requests and causes
+            // the server to filter out model families (e.g. Gemini) that may
+            // not match the declared intent.
+            let mut listing_headers = api_provider.headers.clone();
+            listing_headers.remove("openai-intent");
             let request = build_reqwest_client()
                 .get(url)
                 .query(&[("client_version", client_version.clone())])
-                .headers(api_provider.headers.clone())
+                .headers(listing_headers)
                 .bearer_auth(token);
             let response = timeout(MODELS_REFRESH_TIMEOUT, request.send())
                 .await
@@ -499,7 +505,7 @@ impl ModelsManager {
                         .unwrap_or_else(|| model_info::model_info_from_slug(&model.id));
                     candidate.slug = model.id.clone();
                     if candidate.display_name.is_empty() {
-                        candidate.display_name = model.id.clone();
+                        candidate.display_name = model.id;
                     }
                     candidate.visibility = ModelVisibility::List;
                     candidate.supported_in_api = true;
@@ -670,7 +676,7 @@ impl ModelsManager {
         test_model.description = Some(format!("Test model derived from {base_slug}."));
         test_model.visibility = ModelVisibility::Hide;
         test_model.experimental_supported_tools =
-            tools.iter().map(|tool| tool.to_string()).collect();
+            tools.iter().map(std::string::ToString::to_string).collect();
         models.push(test_model);
     }
 
@@ -1365,6 +1371,77 @@ mod tests;
                 .any(|preset| preset.model == bundled_slug_not_in_endpoint),
             "github-copilot model list should come from endpoint ids, not bundled catalog"
         );
+    }
+
+    /// Verify that the `/models` listing request does NOT send the
+    /// `Openai-Intent` header so the server returns all model families
+    /// (GPT, Claude, Gemini) rather than filtering to a single intent.
+    #[tokio::test]
+    async fn copilot_models_request_omits_openai_intent_header_and_returns_all_families() {
+        let server = MockServer::start().await;
+        let _models_mock = wiremock::Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer copilot-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": "gpt-5.3-codex"},
+                    {"id": "gpt-5.1"},
+                    {"id": "claude-sonnet-4.5"},
+                    {"id": "gemini-2.5-pro"},
+                    {"id": "gemini-2.5-flash"},
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.base_url = Some(server.uri());
+        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::Online)
+            .await
+            .expect("copilot refresh should succeed");
+
+        // Verify the request did NOT include the Openai-Intent header.
+        let requests = server
+            .received_requests()
+            .await
+            .expect("should have received requests");
+        assert_eq!(requests.len(), 1, "expected exactly one /models request");
+        assert!(
+            requests[0].headers.get("openai-intent").is_none(),
+            "the /models listing request must NOT send the Openai-Intent header; \
+             sending it causes the server to filter out model families like Gemini"
+        );
+
+        // Verify ALL model families appear in the resulting model list.
+        let available = manager
+            .try_list_models()
+            .expect("models should be available");
+        let expected_models = [
+            "gpt-5.3-codex",
+            "gpt-5.1",
+            "claude-sonnet-4.5",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+        ];
+        for expected in &expected_models {
+            assert!(
+                available.iter().any(|preset| preset.model == *expected),
+                "expected {expected} in model picker but got: {:?}",
+                available.iter().map(|p| &p.model).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

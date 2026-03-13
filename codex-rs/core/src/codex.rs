@@ -5459,7 +5459,7 @@ fn extract_initial_task_from_input(input: &[UserInput]) -> String {
                 return text.clone();
             }
             UserInput::Skill { name, .. } => {
-                return format!("Run skill: {}", name);
+                return format!("Run skill: {name}");
             }
             UserInput::Image { .. } | UserInput::LocalImage { .. } | UserInput::Mention { .. } => {
                 // Skip, look for text or skill entries.

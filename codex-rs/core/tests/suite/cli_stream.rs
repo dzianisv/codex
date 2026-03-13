@@ -5,10 +5,15 @@ use codex_utils_cargo_bin::find_resource;
 use core_test_support::fs_wait;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use serde_json::json;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 fn repo_root() -> std::path::PathBuf {
     #[expect(clippy::expect_used)]
@@ -659,4 +664,130 @@ async fn integration_git_info_unit_test() {
     assert_eq!(git_info.repository_url, deserialized.repository_url);
 
     println!("✅ Git info serialization test passed!");
+}
+
+/// End-to-end CLI binary test: spawn the real `codex exec` binary with a GitHub
+/// Copilot provider (name = "GitHub Copilot") backed by a mock server. Verifies:
+///
+/// 1. The `/models` request does NOT include the `Openai-Intent` header (the
+///    root cause of Gemini/Claude models being filtered out by the server).
+/// 2. The binary successfully completes a prompt using a Gemini model, proving
+///    the model was accepted from the fetched list.
+/// 3. The `/responses` request IS made (confirming the model was usable).
+///
+/// This tests the actual compiled binary, not just the library code in-process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_copilot_provider_models_request_omits_openai_intent_header() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+
+    // Mount a copilot-format /v1/models endpoint returning GPT + Claude + Gemini.
+    // The GitHub Copilot API returns { "data": [{ "id": "..." }, ...] }.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "gpt-5.3-codex"},
+                {"id": "claude-sonnet-4.5"},
+                {"id": "gemini-2.5-pro"},
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    // Mount a minimal /v1/responses SSE endpoint so the exec command can complete.
+    let sse = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "hello from gemini mock"),
+        responses::ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, sse).await;
+
+    let home = TempDir::new().unwrap();
+    let repo_root = repo_root();
+
+    // Define a copilot provider pointing at the mock server.
+    // name = "GitHub Copilot" triggers is_github_copilot_provider() which
+    // activates the copilot code path: always fetches models from network,
+    // uses OpenAI-compat response format, and (with our fix) strips
+    // Openai-Intent from the /models request.
+    let provider_override = format!(
+        "model_providers.copilot={{ \
+            name = \"GitHub Copilot\", \
+            base_url = \"{base}/v1\", \
+            env_key = \"COPILOT_TEST_KEY\", \
+            wire_api = \"responses\", \
+            http_headers = {{ \"Openai-Intent\" = \"conversation-edits\" }} \
+        }}",
+        base = server.uri(),
+    );
+
+    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd = AssertCommand::new(bin);
+    cmd.timeout(Duration::from_secs(30));
+    cmd.arg("exec")
+        .arg("--skip-git-repo-check")
+        .arg("-c")
+        .arg(&provider_override)
+        .arg("-c")
+        .arg("model_provider=\"copilot\"")
+        .arg("-m")
+        .arg("gemini-2.5-pro")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("hello?");
+    cmd.env("CODEX_HOME", home.path())
+        .env("COPILOT_TEST_KEY", "test-dummy-token");
+
+    let output = cmd.output().unwrap();
+    println!("Status: {}", output.status);
+    println!("Stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+    println!("Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "codex exec with copilot provider and gemini model should succeed; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the /models request did NOT include the Openai-Intent header.
+    // When this header is present, the GitHub Copilot API filters out model
+    // families like Gemini that don't support the declared intent.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server should have recorded requests");
+    let models_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().contains("/models"))
+        .collect();
+    assert!(
+        !models_requests.is_empty(),
+        "expected at least one GET /models request to the mock server"
+    );
+    for req in &models_requests {
+        assert!(
+            req.headers.get("openai-intent").is_none(),
+            "the /models request MUST NOT include the Openai-Intent header; \
+             including it causes the Copilot API to filter out Gemini models. \
+             Headers: {:?}",
+            req.headers
+                .keys()
+                .map(http::header::HeaderName::as_str)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Verify a /responses request was made, proving the Gemini model was
+    // accepted and used for the prompt.
+    let responses_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().contains("/responses"))
+        .collect();
+    assert!(
+        !responses_requests.is_empty(),
+        "expected a POST /responses request, proving gemini-2.5-pro was \
+         accepted as a valid model from the copilot provider"
+    );
 }

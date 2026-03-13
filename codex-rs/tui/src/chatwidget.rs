@@ -6645,7 +6645,7 @@ impl ChatWidget {
 
         let current_provider_id = self.config.model_provider_id.as_str();
         let current_model = self.current_model();
-        let current_label = presets
+        let _current_label = presets
             .iter()
             .find(|preset| {
                 preset.provider_id == current_provider_id
@@ -6715,35 +6715,47 @@ impl ChatWidget {
             })
             .collect();
 
-        if !other_presets.is_empty() {
-            let all_models = other_presets;
-            let mut all_models_search_value = String::from("all models");
-            for provider_preset in &all_models {
-                let label = Self::provider_model_label(
-                    provider_preset.provider_id.as_str(),
-                    provider_preset.model.model.as_str(),
+        for preset in other_presets {
+            let provider_id = preset.provider_id;
+            let model_preset = preset.model;
+            let description =
+                (!model_preset.description.is_empty()).then_some(model_preset.description.clone());
+            let model = model_preset.model.clone();
+            let apply_runtime_selection = provider_id == current_provider_id;
+            let should_prompt_plan_mode_scope = apply_runtime_selection
+                && self.should_prompt_plan_mode_reasoning_scope(
+                    model.as_str(),
+                    Some(model_preset.default_reasoning_effort),
                 );
-                all_models_search_value.push(' ');
-                all_models_search_value.push_str(label.as_str());
-            }
-            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                tx.send(AppEvent::OpenAllModelsPopup {
-                    models: all_models.clone(),
-                });
-            })];
-
-            let is_current = !items.iter().any(|item| item.is_current);
-            let description = Some(format!(
-                "Choose a specific model and reasoning level (current: {current_label})"
-            ));
-
+            let single_supported_effort = model_preset.supported_reasoning_efforts.len() == 1;
+            let preset_for_action = model_preset.clone();
+            let provider_id_for_action = provider_id.clone();
+            let actions: Vec<SelectionAction> = if single_supported_effort {
+                Self::model_selection_actions(
+                    model.clone(),
+                    Some(model_preset.default_reasoning_effort),
+                    should_prompt_plan_mode_scope,
+                    provider_id.clone(),
+                    apply_runtime_selection,
+                )
+            } else {
+                vec![Box::new(move |tx| {
+                    tx.send(AppEvent::OpenReasoningPopup {
+                        provider_id: provider_id_for_action.clone(),
+                        model: preset_for_action.clone(),
+                    });
+                })]
+            };
+            let label = Self::provider_model_label(provider_id.as_str(), model.as_str());
+            let search_value = format!("{label} {}", model_preset.display_name);
             items.push(SelectionItem {
-                name: "All models".to_string(),
+                name: label,
                 description,
-                is_current,
-                search_value: Some(all_models_search_value),
+                is_current: provider_id == current_provider_id && model.as_str() == current_model,
+                is_default: model_preset.is_default,
+                search_value: Some(search_value),
                 actions,
-                dismiss_on_select: true,
+                dismiss_on_select: single_supported_effort,
                 ..Default::default()
             });
         }
@@ -7090,7 +7102,7 @@ impl ChatWidget {
                     });
             } else if provider_changed {
                 self.app_event_tx.send(AppEvent::PersistModelSelection {
-                    provider: Some(provider_to_persist.clone()),
+                    provider: Some(provider_to_persist),
                     model: selected_model,
                     effort: selected_effort,
                 });
