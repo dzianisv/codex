@@ -41,6 +41,7 @@ use tokio::time::timeout;
 use tracing::error;
 use tracing::info;
 use tracing::instrument;
+use tracing::warn;
 
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -132,11 +133,23 @@ struct OpenAiCompatModel {
     id: String,
     #[serde(default)]
     model_picker_enabled: Option<bool>,
+    #[serde(default)]
+    supported_endpoints: Option<Vec<String>>,
 }
 
 impl OpenAiCompatModel {
     fn is_picker_enabled(&self) -> bool {
         !matches!(self.model_picker_enabled, Some(false))
+    }
+
+    fn supports_responses_api(&self) -> bool {
+        self.supported_endpoints.as_ref().is_none_or(|endpoints| {
+            endpoints.iter().any(|endpoint| {
+                endpoint == "/responses"
+                    || endpoint == "responses"
+                    || endpoint.ends_with("/responses")
+            })
+        })
     }
 }
 
@@ -298,6 +311,29 @@ impl ModelsManager {
         refresh_strategy: RefreshStrategy,
     ) -> String {
         if let Some(model) = model.as_ref() {
+            if self.provider.is_github_copilot_provider() {
+                if let Err(err) = self.refresh_available_models(refresh_strategy).await {
+                    error!("failed to refresh available models: {err}");
+                }
+                let remote_models = self.get_remote_models().await;
+                let available = self.build_available_models(remote_models);
+                if available.iter().any(|preset| preset.model == *model) {
+                    return model.to_string();
+                }
+                if let Some(fallback) = available
+                    .iter()
+                    .find(|preset| preset.is_default)
+                    .or_else(|| available.first())
+                    .map(|preset| preset.model.clone())
+                {
+                    warn!(
+                        requested_model = model,
+                        fallback_model = fallback,
+                        "requested github-copilot model is unavailable; falling back to default"
+                    );
+                    return fallback;
+                }
+            }
             return model.to_string();
         }
         if let Err(err) = self.refresh_available_models(refresh_strategy).await {
@@ -557,6 +593,9 @@ impl ModelsManager {
             .enumerate()
             .filter_map(|(index, model)| {
                 if !model.is_picker_enabled() {
+                    return None;
+                }
+                if !model.supports_responses_api() {
                     return None;
                 }
                 if !seen.insert(model.id.clone()) {
@@ -1530,6 +1569,163 @@ mod tests;
                 .iter()
                 .any(|preset| preset.model == "claude-opus-4.6"),
             "model_picker_enabled=false entries must not be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_models_excludes_entries_without_responses_endpoint() {
+        let server = MockServer::start().await;
+        let _models_mock = wiremock::Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer copilot-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {
+                        "id": "gpt-5.3-codex",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/responses"]
+                    },
+                    {
+                        "id": "claude-opus-4.6",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/v1/messages", "/chat/completions"]
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.base_url = Some(server.uri());
+        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::Online)
+            .await
+            .expect("copilot refresh should succeed");
+
+        let available = manager
+            .try_list_models()
+            .expect("models should be available");
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "gpt-5.3-codex"),
+            "expected /responses-capable model to be listed"
+        );
+        assert!(
+            !available
+                .iter()
+                .any(|preset| preset.model == "claude-opus-4.6"),
+            "models without /responses support must not be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_default_model_falls_back_for_unavailable_copilot_model() {
+        let server = MockServer::start().await;
+        let _models_mock = wiremock::Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer copilot-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {
+                        "id": "gpt-5.3-codex",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/responses"]
+                    },
+                    {
+                        "id": "claude-opus-4.6",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/v1/messages", "/chat/completions"]
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.base_url = Some(server.uri());
+        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        let selected = manager
+            .get_default_model(
+                &Some("claude-opus-4.6".to_string()),
+                RefreshStrategy::OnlineIfUncached,
+            )
+            .await;
+        assert_eq!(
+            selected, "gpt-5.3-codex",
+            "unavailable copilot model should fall back to a valid default"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_default_model_falls_back_after_initial_models_refresh() {
+        let server = MockServer::start().await;
+        let _models_mock = wiremock::Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer copilot-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {
+                        "id": "gpt-5.3-codex",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/responses"]
+                    },
+                    {
+                        "id": "claude-opus-4.6",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/v1/messages", "/chat/completions"]
+                    }
+                ]
+            })))
+            .expect(2)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.base_url = Some(server.uri());
+        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        // Mimic the production startup flow, which refreshes once before selecting the model.
+        let _ = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+
+        let selected = manager
+            .get_default_model(
+                &Some("claude-opus-4.6".to_string()),
+                RefreshStrategy::OnlineIfUncached,
+            )
+            .await;
+        assert_eq!(
+            selected, "gpt-5.3-codex",
+            "unavailable copilot model should still fall back after startup refresh"
         );
     }
 
