@@ -443,7 +443,7 @@ impl Codex {
         {
             let _ = models_manager.list_models(refresh_strategy).await;
         }
-        let model = models_manager
+        let mut model = models_manager
             .get_default_model(&config.model, refresh_strategy)
             .await;
 
@@ -451,7 +451,24 @@ impl Codex {
         // 1. config.base_instructions override
         // 2. conversation history => session_meta.base_instructions
         // 3. base_instructions for current model
-        let model_info = models_manager.get_model_info(model.as_str(), &config).await;
+        let mut model_info = models_manager.get_model_info(model.as_str(), &config).await;
+        if config.model_provider.is_github_copilot_provider()
+            && config.model.is_some()
+            && model_info.used_fallback_model_metadata
+        {
+            let fallback_model = models_manager
+                .get_default_model(&None, refresh_strategy)
+                .await;
+            if !fallback_model.is_empty() && fallback_model != model {
+                warn!(
+                    requested_model = model,
+                    fallback_model,
+                    "requested github-copilot model is unavailable; switching to default model"
+                );
+                model = fallback_model;
+                model_info = models_manager.get_model_info(model.as_str(), &config).await;
+            }
+        }
         let base_instructions = config
             .base_instructions
             .clone()

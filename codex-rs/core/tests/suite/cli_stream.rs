@@ -653,3 +653,95 @@ async fn cli_copilot_provider_models_request_omits_openai_intent_header() {
          accepted as a valid model from the copilot provider"
     );
 }
+
+/// End-to-end CLI binary regression for issue #11:
+/// when a requested Copilot model is not `/responses`-capable,
+/// Codex must fall back to a valid Copilot model and still complete the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_copilot_non_responses_model_falls_back_and_completes() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {
+                    "id": "gpt-5.3-codex",
+                    "model_picker_enabled": true,
+                    "supported_endpoints": ["/responses"]
+                },
+                {
+                    "id": "claude-opus-4.6",
+                    "model_picker_enabled": true,
+                    "supported_endpoints": ["/v1/messages", "/chat/completions"]
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let sse = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "fallback path ok"),
+        responses::ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, sse).await;
+
+    let home = TempDir::new().unwrap();
+    let repo_root = repo_root();
+    let provider_override = format!(
+        "model_providers.copilot={{ \
+            name = \"GitHub Copilot\", \
+            base_url = \"{base}/v1\", \
+            env_key = \"COPILOT_TEST_KEY\", \
+            wire_api = \"responses\" \
+        }}",
+        base = server.uri(),
+    );
+
+    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd = AssertCommand::new(bin);
+    cmd.timeout(Duration::from_secs(30));
+    cmd.arg("exec")
+        .arg("--skip-git-repo-check")
+        .arg("-c")
+        .arg(&provider_override)
+        .arg("-c")
+        .arg("model_provider=\"copilot\"")
+        .arg("-m")
+        .arg("claude-opus-4.6")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("When the first gpt model was released?");
+    cmd.env("CODEX_HOME", home.path())
+        .env("COPILOT_TEST_KEY", "test-dummy-token");
+
+    let output = cmd.output().unwrap();
+    println!("Status: {}", output.status);
+    println!("Stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+    println!("Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "codex exec should succeed via fallback model; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server should have recorded requests");
+    let responses_request = requests
+        .iter()
+        .find(|req| req.url.path().contains("/responses"))
+        .expect("expected POST /responses request");
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&responses_request.body).expect("responses request body is json");
+    assert_eq!(
+        body.get("model").and_then(serde_json::Value::as_str),
+        Some("gpt-5.3-codex"),
+        "non-/responses requested model should fall back to a valid Copilot model"
+    );
+}
