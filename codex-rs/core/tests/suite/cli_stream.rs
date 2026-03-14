@@ -793,10 +793,10 @@ async fn cli_copilot_provider_models_request_omits_openai_intent_header() {
 }
 
 /// End-to-end CLI binary regression for issue #11:
-/// when a requested Copilot model is not `/responses`-capable,
-/// Codex must fall back to a valid Copilot model and still complete the run.
+/// when a requested Copilot model is chat-completions-only, Codex should
+/// keep that model selected and transparently fall back to `/chat/completions`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_copilot_non_responses_model_falls_back_and_completes() {
+async fn cli_copilot_chat_completions_only_model_completes() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -820,12 +820,34 @@ async fn cli_copilot_non_responses_model_falls_back_and_completes() {
         .mount(&server)
         .await;
 
-    let sse = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "fallback path ok"),
-        responses::ev_completed("resp-1"),
-    ]);
-    responses::mount_sse_once(&server, sse).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "message": "model claude-opus-4.6 does not support Responses API.",
+                "code": "unsupported_api_for_model"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-fallback-1",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "GPT-1 was released in June 2018."
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
 
     let home = TempDir::new().unwrap();
     let repo_root = repo_root();
@@ -870,16 +892,28 @@ async fn cli_copilot_non_responses_model_falls_back_and_completes() {
         .received_requests()
         .await
         .expect("mock server should have recorded requests");
+
     let responses_request = requests
         .iter()
         .find(|req| req.url.path().contains("/responses"))
         .expect("expected POST /responses request");
-
     let body: serde_json::Value =
         serde_json::from_slice(&responses_request.body).expect("responses request body is json");
     assert_eq!(
         body.get("model").and_then(serde_json::Value::as_str),
-        Some("gpt-5.3-codex"),
-        "non-/responses requested model should fall back to a valid Copilot model"
+        Some("claude-opus-4.6"),
+        "original selected model should be attempted on /responses first"
+    );
+
+    let chat_request = requests
+        .iter()
+        .find(|req| req.url.path().contains("/chat/completions"))
+        .expect("expected POST /chat/completions fallback request");
+    let chat_body: serde_json::Value =
+        serde_json::from_slice(&chat_request.body).expect("chat completions request body is json");
+    assert_eq!(
+        chat_body.get("model").and_then(serde_json::Value::as_str),
+        Some("claude-opus-4.6"),
+        "fallback /chat/completions request should keep the user-selected model"
     );
 }

@@ -34,6 +34,7 @@ use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
+use codex_api::AuthProvider;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
@@ -63,6 +64,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -74,6 +76,8 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use serde_json::Value as JsonValue;
+use serde_json::json;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -1088,9 +1092,99 @@ impl ModelClientSession {
                     );
                     continue;
                 }
+                Err(err)
+                    if self.client.state.provider.is_github_copilot_provider()
+                        && supports_chat_completions_fallback(&err) =>
+                {
+                    warn!(
+                        model = model_info.slug,
+                        "responses api rejected model; falling back to chat/completions"
+                    );
+                    return self.stream_chat_completions_api(prompt, model_info).await;
+                }
                 Err(err) => return Err(map_api_error(err)),
             }
         }
+    }
+
+    async fn stream_chat_completions_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+    ) -> Result<ResponseStream> {
+        let client_setup = self.client.current_client_setup().await?;
+        let token = client_setup.api_auth.bearer_token().ok_or_else(|| {
+            CodexErr::Stream(
+                "missing auth token for GitHub Copilot chat/completions fallback".to_string(),
+                None,
+            )
+        })?;
+
+        let mut request_builder = build_reqwest_client()
+            .post(format!(
+                "{}/chat/completions",
+                client_setup.api_provider.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(token);
+        for (name, value) in &client_setup.api_provider.headers {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let messages = build_chat_completions_messages(prompt);
+        let request_body = json!({
+            "model": model_info.slug,
+            "messages": messages,
+            "stream": false
+        });
+        let response = request_builder
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        let status = response.status();
+        let payload = response
+            .text()
+            .await
+            .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        if !status.is_success() {
+            return Err(CodexErr::Stream(
+                format!("chat/completions fallback failed: {status}; body: {payload}"),
+                None,
+            ));
+        }
+
+        let response_json: JsonValue = serde_json::from_str(&payload)
+            .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        let response_id = response_json
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("chat-completions-fallback")
+            .to_string();
+        let assistant_text = extract_chat_completions_text(&response_json).ok_or_else(|| {
+            CodexErr::Stream(
+                "chat/completions fallback returned no assistant content".to_string(),
+                None,
+            )
+        })?;
+
+        let (tx_event, rx_event) = mpsc::channel(8);
+        let _ = tx_event.try_send(Ok(ResponseEvent::Created));
+        let _ = tx_event.try_send(Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: assistant_text,
+            }],
+            end_turn: None,
+            phase: None,
+        })));
+        let _ = tx_event.try_send(Ok(ResponseEvent::Completed {
+            response_id,
+            token_usage: None,
+        }));
+        drop(tx_event);
+
+        Ok(ResponseStream { rx_event })
     }
 
     /// Streams a turn via the Responses API over WebSocket transport.
@@ -1405,6 +1499,96 @@ fn build_responses_headers(
         headers.insert(X_CODEX_TURN_METADATA_HEADER, header_value.clone());
     }
     headers
+}
+
+fn supports_chat_completions_fallback(err: &ApiError) -> bool {
+    if let ApiError::Transport(TransportError::Http {
+        status,
+        body: Some(body),
+        ..
+    }) = err
+    {
+        return *status == StatusCode::BAD_REQUEST
+            && (body.contains("unsupported_api_for_model")
+                || body.contains("does not support Responses API"));
+    }
+    false
+}
+
+fn build_chat_completions_messages(prompt: &Prompt) -> Vec<JsonValue> {
+    let mut messages = Vec::new();
+    if !prompt.base_instructions.text.trim().is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": prompt.base_instructions.text
+        }));
+    }
+
+    for item in prompt.get_formatted_input() {
+        if let ResponseItem::Message { role, content, .. } = item {
+            let text = content_items_to_text(&content);
+            if text.trim().is_empty() {
+                continue;
+            }
+            let role = match role.as_str() {
+                "assistant" => "assistant",
+                "user" => "user",
+                "developer" | "system" => "system",
+                _ => "user",
+            };
+            messages.push(json!({
+                "role": role,
+                "content": text
+            }));
+        }
+    }
+
+    if messages.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": "Continue."
+        }));
+    }
+
+    messages
+}
+
+fn content_items_to_text(content: &[ContentItem]) -> String {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text),
+            ContentItem::InputImage { .. } => None,
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+fn extract_chat_completions_text(response_json: &JsonValue) -> Option<String> {
+    let content = response_json
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?;
+
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+
+    content.as_array().and_then(|parts| {
+        let joined = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(JsonValue::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    })
 }
 
 fn map_response_stream<S>(

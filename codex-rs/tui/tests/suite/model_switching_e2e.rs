@@ -322,6 +322,103 @@ async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provide
     Ok(())
 }
 
+#[tokio::test]
+async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model() -> Result<()> {
+    // run_codex_cli_with_filter() does not work on Windows due to PTY limitations.
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
+
+    let prompt = "When the first gpt model was released?";
+    let answer_text = "The first GPT model (GPT-1) was released in June 2018.";
+    let selected_model = "claude-opus-4.6";
+    let (base_url, server) = spawn_openai_compat_models_with_chat_completions_fallback_server(
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "copilot-test-a",
+                    "object": "model",
+                    "model_picker_enabled": true,
+                    "supported_endpoints": ["/responses"]
+                },
+                {
+                    "id": selected_model,
+                    "object": "model",
+                    "model_picker_enabled": true,
+                    "supported_endpoints": ["/v1/messages", "/chat/completions"]
+                }
+            ]
+        }),
+        selected_model,
+        answer_text,
+    )?;
+    let codex_home = tempdir_with_local_copilot_config(
+        &repo_root,
+        "copilot-test-a",
+        base_url.as_str(),
+        &["copilot-test-a", selected_model],
+    )?;
+
+    let mut env = HashMap::new();
+    env.insert(
+        "COPILOT_TEST_KEY".to_string(),
+        "test-copilot-token".to_string(),
+    );
+    let output = run_codex_cli_with_filter(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        "copilot-test-a",
+        selected_model,
+        Some(prompt),
+        env,
+    )
+    .await
+    .context("switch to chat-completions-only Copilot model and run prompt")?;
+    assert_model_and_provider_in_config(
+        codex_home.path(),
+        selected_model,
+        "copilot-local",
+        &output,
+    )?;
+    anyhow::ensure!(
+        output.contains("2018"),
+        "expected fallback answer to include 2018, got output: {output}"
+    );
+
+    let requests = server.join().expect("model/responses server should join")?;
+    let responses_request = requests
+        .iter()
+        .find(|request| request.starts_with("POST /v1/responses "))
+        .context("missing POST /v1/responses request")?;
+    anyhow::ensure!(
+        responses_request.contains("\"model\":\"claude-opus-4.6\""),
+        "expected switched model in /responses request body; request: {responses_request}"
+    );
+
+    let chat_request = requests
+        .iter()
+        .find(|request| request.starts_with("POST /v1/chat/completions "))
+        .context("missing POST /v1/chat/completions request")?;
+    anyhow::ensure!(
+        chat_request.contains("\"model\":\"claude-opus-4.6\""),
+        "expected switched model in /chat/completions request body; request: {chat_request}"
+    );
+    anyhow::ensure!(
+        chat_request.contains(prompt),
+        "expected prompt text in /chat/completions request body; request: {chat_request}"
+    );
+
+    Ok(())
+}
+
 fn tempdir_with_catalog_and_config(repo_root: &Path) -> Result<TempDir> {
     let codex_home = tempfile::tempdir()?;
 
@@ -800,6 +897,145 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                             responses_sse.len(),
                             responses_sse
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+
+                    stream
+                        .write_all(response.as_bytes())
+                        .context("failed to write test server response")?;
+                    stream
+                        .flush()
+                        .context("failed to flush test server response")?;
+
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(8));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(requests)
+    });
+
+    Ok((format!("http://{address}/v1"), handle))
+}
+
+fn spawn_openai_compat_models_with_chat_completions_fallback_server(
+    models_response_json: serde_json::Value,
+    fallback_model: &str,
+    answer_text: &str,
+) -> Result<(String, thread::JoinHandle<Result<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let models_response_body = models_response_json.to_string();
+    let fallback_model_json = serde_json::to_string(fallback_model)?;
+    let answer_json = serde_json::to_string(answer_text)?;
+    let responses_error = format!(
+        "{{\"error\":{{\"message\":\"model {fallback_model} does not support Responses API.\",\"code\":\"unsupported_api_for_model\"}}}}"
+    );
+    let chat_completions_response = format!(
+        "{{\"id\":\"chatcmpl-fallback-1\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":{answer_json}}},\"finish_reason\":\"stop\"}}],\"model\":{fallback_model_json}}}"
+    );
+    let handle = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .context("failed to set nonblocking listener")?;
+        let mut requests = Vec::new();
+        let hard_deadline = Instant::now() + Duration::from_secs(30);
+        let mut idle_deadline: Option<Instant> = None;
+        while Instant::now() < hard_deadline
+            && idle_deadline
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(true)
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .context("failed to set read timeout")?;
+
+                    let mut raw_request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                raw_request.extend_from_slice(&chunk[..bytes_read]);
+                                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let header_end = raw_request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                        .context("HTTP headers terminator not found")?;
+                    let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_string();
+                    let request_line = headers
+                        .lines()
+                        .next()
+                        .context("missing request line")?
+                        .to_string();
+
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let lower = line.to_ascii_lowercase();
+                            lower
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+
+                    let mut body_bytes = raw_request[header_end..].to_vec();
+                    while body_bytes.len() < content_length {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => body_bytes.extend_from_slice(&chunk[..bytes_read]),
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let body = String::from_utf8_lossy(&body_bytes).to_string();
+                    requests.push(format!("{request_line}\n{body}"));
+
+                    let response = if request_line.starts_with("GET /v1/models ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            models_response_body.len(),
+                            models_response_body
+                        )
+                    } else if request_line.starts_with("POST /v1/responses ") {
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            responses_error.len(),
+                            responses_error
+                        )
+                    } else if request_line.starts_with("POST /v1/chat/completions ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            chat_completions_response.len(),
+                            chat_completions_response
                         )
                     } else {
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

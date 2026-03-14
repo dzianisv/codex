@@ -133,23 +133,30 @@ struct OpenAiCompatModel {
     id: String,
     #[serde(default)]
     model_picker_enabled: Option<bool>,
-    #[serde(default)]
-    supported_endpoints: Option<Vec<String>>,
 }
 
 impl OpenAiCompatModel {
     fn is_picker_enabled(&self) -> bool {
         !matches!(self.model_picker_enabled, Some(false))
     }
+}
 
-    fn supports_responses_api(&self) -> bool {
-        self.supported_endpoints.as_ref().is_none_or(|endpoints| {
-            endpoints.iter().any(|endpoint| {
-                endpoint == "/responses"
-                    || endpoint == "responses"
-                    || endpoint.ends_with("/responses")
-            })
-        })
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaTagsModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagsModel {
+    name: String,
+    #[serde(default)]
+    model_picker_enabled: Option<bool>,
+}
+
+impl OllamaTagsModel {
+    fn is_picker_enabled(&self) -> bool {
+        !matches!(self.model_picker_enabled, Some(false))
     }
 }
 
@@ -522,8 +529,25 @@ impl ModelsManager {
             // is required.
             let url = format!("{}/models", api_provider.base_url.trim_end_matches('/'));
             let request = build_reqwest_client().get(url);
-            self.fetch_openai_compat_models(request, "local-oss")
-                .await?
+            match self.fetch_openai_compat_models(request, "local-oss").await {
+                Ok(models_and_etag) => models_and_etag,
+                Err(primary_err) => {
+                    info!(
+                        "local-oss /v1/models lookup failed, attempting ollama /api/tags fallback: {primary_err}"
+                    );
+                    match self.fetch_ollama_tags_models(&api_provider.base_url).await {
+                        Ok(models_and_etag) => models_and_etag,
+                        Err(fallback_err) => {
+                            return Err(CodexErr::Stream(
+                                format!(
+                                    "failed to fetch local-oss models from /v1/models ({primary_err}) and /api/tags ({fallback_err})"
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
         } else {
             let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
             let transport = ReqwestTransport::new(build_reqwest_client());
@@ -547,8 +571,9 @@ impl ModelsManager {
 
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
+        let provider_scope = self.cache_scope_key();
         self.cache_manager
-            .persist_cache(&models, etag, client_version)
+            .persist_cache(&models, etag, client_version, provider_scope)
             .await;
         Ok(())
     }
@@ -585,31 +610,84 @@ impl ModelsManager {
             .json()
             .await
             .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
-        let mut seen = HashSet::new();
-        let bundled_models = Self::load_remote_models_from_file().unwrap_or_default();
-        let models = payload
+        let model_ids = payload
             .data
             .into_iter()
+            .filter(|model| model.is_picker_enabled())
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        let models = self.map_provider_model_ids(model_ids);
+        Ok((models, etag))
+    }
+
+    async fn fetch_ollama_tags_models(
+        &self,
+        base_url: &str,
+    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        let tags_url = Self::ollama_tags_url(base_url);
+        let response = timeout(
+            MODELS_REFRESH_TIMEOUT,
+            build_reqwest_client().get(tags_url).send(),
+        )
+        .await
+        .map_err(|_| CodexErr::Timeout)?
+        .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(CodexErr::Stream(
+                format!("failed to fetch models from ollama /api/tags: {status}; body: {body}"),
+                None,
+            ));
+        }
+
+        let payload: OllamaTagsResponse = response
+            .json()
+            .await
+            .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        let model_ids = payload
+            .models
+            .into_iter()
+            .filter(|model| model.is_picker_enabled())
+            .map(|model| model.name)
+            .collect::<Vec<_>>();
+        let models = self.map_provider_model_ids(model_ids);
+        Ok((models, etag))
+    }
+
+    fn ollama_tags_url(base_url: &str) -> String {
+        let trimmed = base_url.trim_end_matches('/');
+        if let Some(without_v1) = trimmed.strip_suffix("/v1") {
+            return format!("{without_v1}/api/tags");
+        }
+        format!("{trimmed}/api/tags")
+    }
+
+    fn map_provider_model_ids(&self, model_ids: Vec<String>) -> Vec<ModelInfo> {
+        let mut seen = HashSet::new();
+        let bundled_models = Self::load_remote_models_from_file().unwrap_or_default();
+        model_ids
+            .into_iter()
             .enumerate()
-            .filter_map(|(index, model)| {
-                if !model.is_picker_enabled() {
-                    return None;
-                }
-                if !model.supports_responses_api() {
-                    return None;
-                }
-                if !seen.insert(model.id.clone()) {
+            .filter_map(|(index, model_id)| {
+                if !seen.insert(model_id.clone()) {
                     return None;
                 }
 
                 let mut candidate = bundled_models
                     .iter()
-                    .find(|bundled| bundled.slug == model.id)
+                    .find(|bundled| bundled.slug == model_id)
                     .cloned()
-                    .unwrap_or_else(|| model_info::model_info_from_slug(&model.id));
-                candidate.slug = model.id.clone();
+                    .unwrap_or_else(|| model_info::model_info_from_slug(&model_id));
+                candidate.slug = model_id.clone();
                 if candidate.display_name.is_empty() {
-                    candidate.display_name = model.id;
+                    candidate.display_name = model_id;
                 }
                 candidate.visibility = ModelVisibility::List;
                 candidate.supported_in_api = true;
@@ -617,12 +695,24 @@ impl ModelsManager {
                 candidate.used_fallback_model_metadata = false;
                 Some(candidate)
             })
-            .collect::<Vec<_>>();
-        Ok((models, etag))
+            .collect()
     }
 
     async fn get_etag(&self) -> Option<String> {
         self.etag.read().await.clone()
+    }
+
+    fn cache_scope_key(&self) -> String {
+        let auth_mode = self.auth_manager.auth_mode();
+        let base_url = self
+            .provider
+            .to_api_provider(auth_mode)
+            .map(|provider| provider.base_url)
+            .unwrap_or_else(|_| self.provider.base_url.clone().unwrap_or_default());
+        format!(
+            "provider_name={};base_url={base_url};auth_mode={auth_mode:?}",
+            self.provider.name
+        )
     }
 
     /// Replace the cached remote models and rebuild the derived presets list.
@@ -663,8 +753,13 @@ impl ModelsManager {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::models_manager::client_version_to_whole();
+        let provider_scope = self.cache_scope_key();
         info!(client_version, "models cache: evaluating cache eligibility");
-        let cache = match self.cache_manager.load_fresh(&client_version).await {
+        let cache = match self
+            .cache_manager
+            .load_fresh(&client_version, &provider_scope)
+            .await
+        {
             Some(cache) => cache,
             None => {
                 info!("models cache: no usable cache entry");
@@ -1429,6 +1524,7 @@ mod tests;
                 &[remote_model(stale_cache_slug, "Stale", 0)],
                 None,
                 crate::models_manager::client_version_to_whole(),
+                "provider_name=other;base_url=http://other.invalid;auth_mode=None".to_string(),
             )
             .await;
 
@@ -1573,7 +1669,7 @@ mod tests;
     }
 
     #[tokio::test]
-    async fn copilot_models_excludes_entries_without_responses_endpoint() {
+    async fn copilot_models_includes_entries_without_responses_endpoint() {
         let server = MockServer::start().await;
         let _models_mock = wiremock::Mock::given(method("GET"))
             .and(path("/models"))
@@ -1623,10 +1719,10 @@ mod tests;
             "expected /responses-capable model to be listed"
         );
         assert!(
-            !available
+            available
                 .iter()
                 .any(|preset| preset.model == "claude-opus-4.6"),
-            "models without /responses support must not be listed"
+            "chat-completions-only models should still be listed when picker-enabled"
         );
     }
 
@@ -1673,8 +1769,8 @@ mod tests;
             )
             .await;
         assert_eq!(
-            selected, "gpt-5.3-codex",
-            "unavailable copilot model should fall back to a valid default"
+            selected, "claude-opus-4.6",
+            "requested picker-enabled model should be preserved"
         );
     }
 
@@ -1724,8 +1820,8 @@ mod tests;
             )
             .await;
         assert_eq!(
-            selected, "gpt-5.3-codex",
-            "unavailable copilot model should still fall back after startup refresh"
+            selected, "claude-opus-4.6",
+            "requested picker-enabled model should still be preserved after startup refresh"
         );
     }
 
@@ -1840,6 +1936,202 @@ mod tests;
                 .any(|preset| preset.model.starts_with("gpt-")),
             "bundled GPT models should not appear for OSS providers; got: {:?}",
             available.iter().map(|p| &p.model).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn oss_provider_falls_back_to_ollama_api_tags() {
+        let server = MockServer::start().await;
+
+        let _v1_models = wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _api_tags = wiremock::Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [
+                    {"name": "llama3.2:latest"},
+                    {"name": "qwen2.5-coder:7b"},
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+        let provider = crate::model_provider_info::create_oss_provider_with_base_url(
+            &format!("{}/v1", server.uri()),
+            WireApi::Responses,
+        );
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("OSS refresh should succeed via /api/tags fallback");
+
+        let available = manager
+            .try_list_models()
+            .expect("models should be available");
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "llama3.2:latest"),
+            "expected llama3.2:latest from /api/tags response"
+        );
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "qwen2.5-coder:7b"),
+            "expected qwen2.5-coder:7b from /api/tags response"
+        );
+        assert!(
+            !available
+                .iter()
+                .any(|preset| preset.model.starts_with("gpt-")),
+            "bundled GPT models should not appear for OSS providers; got: {:?}",
+            available.iter().map(|p| &p.model).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn online_if_uncached_ignores_cache_from_other_provider_for_openai_compatible() {
+        let codex_home = tempdir().expect("temp dir");
+        let copilot_auth =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+        let mut copilot_provider = ModelProviderInfo::create_github_copilot_provider();
+        copilot_provider.base_url = Some("https://api.githubcopilot.com".to_string());
+        let copilot_manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            copilot_auth,
+            copilot_provider,
+        );
+
+        let leaked_slug = "copilot-cache-only-model";
+        copilot_manager
+            .cache_manager
+            .persist_cache(
+                &[remote_model(leaked_slug, "Leaked", 0)],
+                None,
+                crate::models_manager::client_version_to_whole(),
+                copilot_manager.cache_scope_key(),
+            )
+            .await;
+
+        let azure_auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("azure-key"));
+        let azure_provider = ModelProviderInfo {
+            name: "Azure".to_string(),
+            base_url: Some("https://azure.example.com/openai".to_string()),
+            env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: Some(
+                [("api-version".to_string(), "2025-04-01-preview".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            stream_idle_timeout_ms: Some(5_000),
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+        let azure_manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            azure_auth,
+            azure_provider,
+        );
+
+        let available = azure_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await;
+        assert!(
+            !available.iter().any(|preset| preset.model == leaked_slug),
+            "azure/openai-compatible provider must ignore cache entries from github-copilot scope"
+        );
+
+        let bundled_default_slug = ModelsManager::load_remote_models_from_file()
+            .expect("bundled models should load")
+            .first()
+            .expect("bundled catalog should have at least one model")
+            .slug
+            .clone();
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == bundled_default_slug),
+            "azure/openai-compatible provider should keep bundled catalog when cache is mismatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_oss_provider_ignores_cache_from_other_provider() {
+        let codex_home = tempdir().expect("temp dir");
+        let openai_auth =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let openai_manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            openai_auth,
+            provider_for("https://api.openai.com/v1".to_string()),
+        );
+
+        let leaked_slug = "openai-cache-only-model";
+        openai_manager
+            .cache_manager
+            .persist_cache(
+                &[remote_model(leaked_slug, "Leaked", 0)],
+                None,
+                crate::models_manager::client_version_to_whole(),
+                openai_manager.cache_scope_key(),
+            )
+            .await;
+
+        let server = MockServer::start().await;
+        let _mock = wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": "qwen2.5-coder:7b"}
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let oss_auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+        let oss_provider = crate::model_provider_info::create_oss_provider_with_base_url(
+            &format!("{}/v1", server.uri()),
+            WireApi::Responses,
+        );
+        let oss_manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            oss_auth,
+            oss_provider,
+        );
+
+        let available = oss_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await;
+        assert!(
+            !available.iter().any(|preset| preset.model == leaked_slug),
+            "local OSS provider must ignore cache entries from non-OSS provider scopes"
+        );
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "qwen2.5-coder:7b"),
+            "local OSS provider should refresh from /v1/models when cache scope mismatches"
         );
     }
 }
