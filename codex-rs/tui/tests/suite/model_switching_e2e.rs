@@ -4,12 +4,15 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::config::ConfigBuilder;
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::select;
@@ -461,6 +464,123 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
     Ok(())
 }
 
+#[tokio::test]
+async fn models_dev_provider_model_switch_then_prompt_uses_selected_model() -> Result<()> {
+    // run_codex_cli_with_filter() does not work on Windows due to PTY limitations.
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
+
+    let prompt = "When the first gpt model was released?";
+    let answer_text = "The first GPT model (GPT-1) was released in June 2018.";
+    let startup_model = "azure-model-a";
+    let selected_model = "azure-model-b";
+    let provider_id = "azure-local";
+
+    let (provider_base_url, models_dev_url, server) = spawn_models_dev_and_responses_server(
+        "azure",
+        "Azure",
+        &[startup_model, selected_model],
+        selected_model,
+        answer_text,
+    )?;
+    let codex_home = tempdir_with_models_dev_provider_config(
+        &repo_root,
+        provider_id,
+        "Azure",
+        startup_model,
+        provider_base_url.as_str(),
+        "AZURE_TEST_KEY",
+    )?;
+
+    let mut env = HashMap::new();
+    env.insert("AZURE_TEST_KEY".to_string(), "test-azure-token".to_string());
+    env.insert("CODEX_MODELS_DEV_URL".to_string(), models_dev_url);
+
+    let output = run_codex_cli_with_filter(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        startup_model,
+        selected_model,
+        Some(prompt),
+        env,
+    )
+    .await
+    .context("switch model via /model for models.dev provider and run prompt")?;
+    let requests = server
+        .join()
+        .expect("models.dev/responses server should join")?;
+
+    anyhow::ensure!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("GET /api.json ")),
+        "expected GET /api.json request; got requests: {requests:?}; output: {output}"
+    );
+    assert_model_and_provider_in_config(codex_home.path(), selected_model, provider_id, &output)?;
+    anyhow::ensure!(
+        output.contains("2018"),
+        "expected answer to contain 2018, got output: {output}"
+    );
+    let responses_request = requests
+        .iter()
+        .find(|request| request.starts_with("POST /v1/responses "))
+        .context("missing POST /v1/responses request")?;
+    anyhow::ensure!(
+        responses_request.contains("\"model\":\"azure-model-b\""),
+        "expected switched model in /responses request body; request: {responses_request}"
+    );
+    anyhow::ensure!(
+        responses_request.contains(prompt),
+        "expected prompt text in /responses request body; request: {responses_request}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn models_dev_provider_config_parses_custom_provider() -> Result<()> {
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let codex_home = tempdir_with_models_dev_provider_config(
+        &repo_root,
+        "azure-local",
+        "Azure",
+        "azure-model-a",
+        "http://127.0.0.1:12345/v1",
+        "AZURE_TEST_KEY",
+    )?;
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+
+    anyhow::ensure!(
+        config.model_provider_id == "azure-local",
+        "expected model_provider_id=azure-local, got {}",
+        config.model_provider_id
+    );
+    anyhow::ensure!(
+        config.model_provider.name == "Azure",
+        "expected model_provider.name=Azure, got {}",
+        config.model_provider.name
+    );
+    anyhow::ensure!(
+        config.model_providers.contains_key("azure-local"),
+        "expected model_providers to contain azure-local, got keys: {:?}",
+        config.model_providers.keys().collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
 fn tempdir_with_catalog_and_config(repo_root: &Path) -> Result<TempDir> {
     let codex_home = tempfile::tempdir()?;
 
@@ -557,6 +677,36 @@ model_catalog_json = "{catalog_display}"
 name = "GitHub Copilot"
 base_url = "{base_url}"
 env_key = "COPILOT_TEST_KEY"
+wire_api = "responses"
+
+[projects."{repo_root_display}"]
+trust_level = "trusted"
+"#
+    );
+    std::fs::write(codex_home.path().join("config.toml"), config_contents)?;
+
+    Ok(codex_home)
+}
+
+fn tempdir_with_models_dev_provider_config(
+    repo_root: &Path,
+    provider_id: &str,
+    provider_name: &str,
+    model: &str,
+    base_url: &str,
+    env_key: &str,
+) -> Result<TempDir> {
+    let codex_home = tempfile::tempdir()?;
+
+    let repo_root_display = repo_root.display();
+    let config_contents = format!(
+        r#"model_provider = "{provider_id}"
+model = "{model}"
+
+[model_providers.{provider_id}]
+name = "{provider_name}"
+base_url = "{base_url}"
+env_key = "{env_key}"
 wire_api = "responses"
 
 [projects."{repo_root_display}"]
@@ -905,11 +1055,38 @@ fn find_codex_cli(cwd: &Path) -> Option<PathBuf> {
     if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
         return Some(path);
     }
+    if ensure_fallback_codex_binary_is_built(cwd).is_err() {
+        return None;
+    }
     let fallback = cwd.join("codex-rs/target/debug/codex");
     if fallback.is_file() {
         return Some(fallback);
     }
     None
+}
+
+fn ensure_fallback_codex_binary_is_built(repo_root: &Path) -> Result<()> {
+    static BUILD_RESULT: OnceLock<Result<()>> = OnceLock::new();
+    let result = BUILD_RESULT.get_or_init(|| {
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("--bin")
+            .arg("codex")
+            .current_dir(repo_root.join("codex-rs"))
+            .status()
+            .context("spawn cargo build --bin codex")?;
+        anyhow::ensure!(
+            status.success(),
+            "cargo build --bin codex failed with status {status}"
+        );
+        Ok(())
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to build fallback codex binary: {err}"
+        )),
+    }
 }
 
 fn spawn_openai_compat_models_and_responses_server(
@@ -1184,6 +1361,179 @@ fn spawn_openai_compat_models_with_chat_completions_fallback_server(
     });
 
     Ok((format!("http://{address}/v1"), handle))
+}
+
+fn spawn_models_dev_and_responses_server(
+    models_dev_provider_id: &str,
+    models_dev_provider_name: &str,
+    model_ids: &[&str],
+    response_model: &str,
+    answer_text: &str,
+) -> Result<(String, String, thread::JoinHandle<Result<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+
+    let provider_api = format!("http://{address}/v1");
+    let model_entries = model_ids
+        .iter()
+        .map(|model_id| {
+            (
+                model_id.to_string(),
+                serde_json::json!({
+                    "id": model_id,
+                    "name": model_id,
+                    "release_date": "2026-01-01",
+                    "attachment": false,
+                    "reasoning": true,
+                    "temperature": true,
+                    "tool_call": true,
+                    "limit": {"context": 128000, "output": 4096},
+                    "options": {}
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let models_dev_body = serde_json::json!({
+        models_dev_provider_id: {
+            "id": models_dev_provider_id,
+            "name": models_dev_provider_name,
+            "api": provider_api,
+            "env": ["AZURE_TEST_KEY"],
+            "models": model_entries
+        }
+    })
+    .to_string();
+
+    let response_model_json = serde_json::to_string(response_model)?;
+    let answer_json = serde_json::to_string(answer_text)?;
+    let responses_sse = format!(
+        "event: response.created\n\
+data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-1\",\"model\":{response_model_json}}}}}\n\n\
+event: response.output_item.done\n\
+data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{answer_json}}}]}}}}\n\n\
+event: response.completed\n\
+data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage\":{{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}}}}\n\n"
+    );
+
+    let handle = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .context("failed to set nonblocking listener")?;
+        let mut requests = Vec::new();
+        let hard_deadline = Instant::now() + Duration::from_secs(30);
+        let mut idle_deadline: Option<Instant> = None;
+        while Instant::now() < hard_deadline
+            && idle_deadline
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(true)
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .context("failed to set read timeout")?;
+
+                    let mut raw_request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                raw_request.extend_from_slice(&chunk[..bytes_read]);
+                                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let header_end = raw_request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                        .context("HTTP headers terminator not found")?;
+                    let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_string();
+                    let request_line = headers
+                        .lines()
+                        .next()
+                        .context("missing request line")?
+                        .to_string();
+
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let lower = line.to_ascii_lowercase();
+                            lower
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+
+                    let mut body_bytes = raw_request[header_end..].to_vec();
+                    while body_bytes.len() < content_length {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => body_bytes.extend_from_slice(&chunk[..bytes_read]),
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let body = String::from_utf8_lossy(&body_bytes).to_string();
+                    requests.push(format!("{request_line}\n{body}"));
+
+                    let response = if request_line.starts_with("GET /api.json ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            models_dev_body.len(),
+                            models_dev_body
+                        )
+                    } else if request_line.starts_with("POST /v1/responses ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            responses_sse.len(),
+                            responses_sse
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+
+                    stream
+                        .write_all(response.as_bytes())
+                        .context("failed to write test server response")?;
+                    stream
+                        .flush()
+                        .context("failed to flush test server response")?;
+
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(8));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(requests)
+    });
+
+    Ok((
+        provider_api.clone(),
+        format!("http://{address}/api.json"),
+        handle,
+    ))
 }
 
 async fn type_text_with_stabilization(writer: &tokio::sync::mpsc::Sender<Vec<u8>>, text: &str) {

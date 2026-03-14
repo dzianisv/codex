@@ -43,9 +43,6 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
-use codex_core::GITHUB_COPILOT_PROVIDER_ID;
-use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
-use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -133,28 +130,35 @@ enum ThreadInteractiveRequest {
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
 
+fn provider_uses_authoritative_catalog(config: &Config, provider_id: &str) -> bool {
+    config
+        .model_providers
+        .get(provider_id)
+        .or_else(|| {
+            if provider_id == config.model_provider_id {
+                Some(&config.model_provider)
+            } else {
+                None
+            }
+        })
+        .is_some_and(|provider| !provider.is_openai())
+}
+
 fn startup_models_refresh_strategy(config: &Config) -> RefreshStrategy {
-    if config.model_provider_id == GITHUB_COPILOT_PROVIDER_ID
-        || config.model_provider_id == OLLAMA_OSS_PROVIDER_ID
-        || config.model_provider_id == LMSTUDIO_OSS_PROVIDER_ID
-    {
-        // These providers expose authoritative `/models` endpoints:
+    if provider_uses_authoritative_catalog(config, &config.model_provider_id) {
+        // Non-OpenAI providers can expose runtime-dependent catalogs:
         // - Copilot: server-side model availability changes over time.
         // - Ollama / LM Studio: installed local models can change at runtime.
+        // - Other providers: models.dev/provider APIs are authoritative.
         RefreshStrategy::OnlineIfUncached
     } else {
         RefreshStrategy::Offline
     }
 }
 
-fn model_picker_refresh_strategy(provider_id: &str) -> RefreshStrategy {
-    if provider_id == GITHUB_COPILOT_PROVIDER_ID
-        || provider_id == OLLAMA_OSS_PROVIDER_ID
-        || provider_id == LMSTUDIO_OSS_PROVIDER_ID
-    {
-        // Keep these lists fresh in `/model` so models show up:
-        // - Copilot: newly supported models appear server-side.
-        // - Ollama / LM Studio: user installs/removes models locally.
+fn model_picker_refresh_strategy(config: &Config, provider_id: &str) -> RefreshStrategy {
+    if provider_uses_authoritative_catalog(config, provider_id) {
+        // Keep provider-authoritative lists fresh in `/model`.
         RefreshStrategy::OnlineIfUncached
     } else {
         RefreshStrategy::Offline
@@ -909,25 +913,31 @@ impl App {
 
         let mut presets = Vec::new();
         for provider_id in provider_ids {
-            let refresh_strategy = model_picker_refresh_strategy(provider_id.as_str());
-            let provider_models = if provider_id == active_provider_id {
-                self.server
-                    .get_models_manager()
-                    .list_models(refresh_strategy)
-                    .await
-            } else {
-                let Some(provider) = self.config.model_providers.get(&provider_id).cloned() else {
-                    continue;
-                };
-                let manager = ModelsManager::new(
-                    self.config.codex_home.clone(),
-                    self.auth_manager.clone(),
-                    None,
-                    CollaborationModesConfig::default(),
-                    provider,
-                );
-                manager.list_models(refresh_strategy).await
+            let refresh_strategy =
+                model_picker_refresh_strategy(&self.config, provider_id.as_str());
+            let provider = self
+                .config
+                .model_providers
+                .get(&provider_id)
+                .cloned()
+                .or_else(|| {
+                    if provider_id == active_provider_id {
+                        Some(self.config.model_provider.clone())
+                    } else {
+                        None
+                    }
+                });
+            let Some(provider) = provider else {
+                continue;
             };
+            let manager = ModelsManager::new(
+                self.config.codex_home.clone(),
+                self.auth_manager.clone(),
+                None,
+                CollaborationModesConfig::default(),
+                provider,
+            );
+            let provider_models = manager.list_models(refresh_strategy).await;
             presets.extend(
                 provider_models
                     .into_iter()
@@ -3966,6 +3976,9 @@ mod tests {
     use crate::history_cell::new_session_info;
     use assert_matches::assert_matches;
     use codex_core::CodexAuth;
+    use codex_core::GITHUB_COPILOT_PROVIDER_ID;
+    use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
+    use codex_core::OLLAMA_OSS_PROVIDER_ID;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::types::ModelAvailabilityNuxConfig;
@@ -4086,28 +4099,81 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn model_picker_refresh_fetches_remote_for_github_copilot() {
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_github_copilot() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
         assert_eq!(
-            model_picker_refresh_strategy(GITHUB_COPILOT_PROVIDER_ID),
+            model_picker_refresh_strategy(&config, GITHUB_COPILOT_PROVIDER_ID),
             RefreshStrategy::OnlineIfUncached
         );
+        Ok(())
     }
 
-    #[test]
-    fn model_picker_refresh_fetches_remote_for_ollama() {
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_ollama() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
         assert_eq!(
-            model_picker_refresh_strategy(OLLAMA_OSS_PROVIDER_ID),
+            model_picker_refresh_strategy(&config, OLLAMA_OSS_PROVIDER_ID),
             RefreshStrategy::OnlineIfUncached
         );
+        Ok(())
     }
 
-    #[test]
-    fn model_picker_refresh_fetches_remote_for_lmstudio() {
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_lmstudio() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
         assert_eq!(
-            model_picker_refresh_strategy(LMSTUDIO_OSS_PROVIDER_ID),
+            model_picker_refresh_strategy(&config, LMSTUDIO_OSS_PROVIDER_ID),
             RefreshStrategy::OnlineIfUncached
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_custom_non_openai_provider() -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.model_provider_id = "azure-local".to_string();
+        config.model_providers.insert(
+            "azure-local".to_string(),
+            codex_core::ModelProviderInfo {
+                name: "Azure".to_string(),
+                base_url: Some("https://example.azure.test/v1".to_string()),
+                env_key: Some("AZURE_TEST_KEY".to_string()),
+                env_key_instructions: None,
+                experimental_bearer_token: None,
+                wire_api: codex_core::WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: false,
+                supports_websockets: false,
+            },
+        );
+
+        assert_eq!(
+            model_picker_refresh_strategy(&config, "azure-local"),
+            RefreshStrategy::OnlineIfUncached
+        );
+        Ok(())
     }
 
     #[tokio::test]
