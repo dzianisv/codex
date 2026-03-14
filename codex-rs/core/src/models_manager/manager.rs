@@ -4,7 +4,6 @@ use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::AuthManager;
 use crate::auth::AuthMode;
-use crate::auth::CodexAuth;
 use crate::config::Config;
 use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
@@ -13,17 +12,9 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::models_manager::model_info;
-use crate::response_debug_context::extract_response_debug_context;
-use crate::response_debug_context::telemetry_transport_error_message;
-use crate::util::FeedbackRequestTags;
-use crate::util::emit_feedback_request_tags;
 use codex_api::AuthProvider;
 use codex_api::ModelsClient;
-use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
-use codex_api::TransportError;
-use codex_api::is_azure_responses_wire_base_url;
-use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
@@ -35,7 +26,6 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,91 +34,13 @@ use tokio::sync::TryLockError;
 use tokio::time::timeout;
 use tracing::error;
 use tracing::info;
-use tracing::instrument;
 use tracing::warn;
 
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
-const MODELS_ENDPOINT: &str = "/models";
 const DEFAULT_MODELS_DEV_CATALOG_URL: &str = "https://models.dev/api.json";
 const MODELS_DEV_URL_ENV_KEY: &str = "CODEX_MODELS_DEV_URL";
-
-#[derive(Clone)]
-struct ModelsRequestTelemetry {
-    auth_mode: Option<String>,
-    auth_header_attached: bool,
-    auth_header_name: Option<&'static str>,
-}
-
-impl RequestTelemetry for ModelsRequestTelemetry {
-    fn on_request(
-        &self,
-        attempt: u64,
-        status: Option<http::StatusCode>,
-        error: Option<&TransportError>,
-        duration: Duration,
-    ) {
-        let success = status.is_some_and(|code| code.is_success()) && error.is_none();
-        let error_message = error.map(telemetry_transport_error_message);
-        let response_debug = error
-            .map(extract_response_debug_context)
-            .unwrap_or_default();
-        let status = status.map(|status| status.as_u16());
-        tracing::event!(
-            target: "codex_otel.log_only",
-            tracing::Level::INFO,
-            event.name = "codex.api_request",
-            duration_ms = %duration.as_millis(),
-            http.response.status_code = status,
-            success = success,
-            error.message = error_message.as_deref(),
-            attempt = attempt,
-            endpoint = MODELS_ENDPOINT,
-            auth.header_attached = self.auth_header_attached,
-            auth.header_name = self.auth_header_name,
-            auth.request_id = response_debug.request_id.as_deref(),
-            auth.cf_ray = response_debug.cf_ray.as_deref(),
-            auth.error = response_debug.auth_error.as_deref(),
-            auth.error_code = response_debug.auth_error_code.as_deref(),
-            auth.mode = self.auth_mode.as_deref(),
-        );
-        tracing::event!(
-            target: "codex_otel.trace_safe",
-            tracing::Level::INFO,
-            event.name = "codex.api_request",
-            duration_ms = %duration.as_millis(),
-            http.response.status_code = status,
-            success = success,
-            error.message = error_message.as_deref(),
-            attempt = attempt,
-            endpoint = MODELS_ENDPOINT,
-            auth.header_attached = self.auth_header_attached,
-            auth.header_name = self.auth_header_name,
-            auth.request_id = response_debug.request_id.as_deref(),
-            auth.cf_ray = response_debug.cf_ray.as_deref(),
-            auth.error = response_debug.auth_error.as_deref(),
-            auth.error_code = response_debug.auth_error_code.as_deref(),
-            auth.mode = self.auth_mode.as_deref(),
-        );
-        emit_feedback_request_tags(&FeedbackRequestTags {
-            endpoint: MODELS_ENDPOINT,
-            auth_header_attached: self.auth_header_attached,
-            auth_header_name: self.auth_header_name,
-            auth_mode: self.auth_mode.as_deref(),
-            auth_retry_after_unauthorized: None,
-            auth_recovery_mode: None,
-            auth_recovery_phase: None,
-            auth_connection_reused: None,
-            auth_request_id: response_debug.request_id.as_deref(),
-            auth_cf_ray: response_debug.cf_ray.as_deref(),
-            auth_error: response_debug.auth_error.as_deref(),
-            auth_error_code: response_debug.auth_error_code.as_deref(),
-            auth_recovery_followup_success: None,
-            auth_recovery_followup_status: None,
-        });
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct OpenAiCompatModelsResponse {
@@ -140,21 +52,11 @@ struct OpenAiCompatModel {
     id: String,
     #[serde(default)]
     model_picker_enabled: Option<bool>,
-    #[serde(default)]
-    supported_endpoints: Vec<String>,
 }
 
 impl OpenAiCompatModel {
     fn is_picker_enabled(&self) -> bool {
         !matches!(self.model_picker_enabled, Some(false))
-    }
-
-    fn supports_responses_endpoint(&self) -> bool {
-        self.supported_endpoints.is_empty()
-            || self
-                .supported_endpoints
-                .iter()
-                .any(|endpoint| endpoint.trim_end_matches('/').ends_with("/responses"))
     }
 }
 
@@ -237,22 +139,6 @@ pub enum RefreshStrategy {
     OnlineIfUncached,
 }
 
-impl RefreshStrategy {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Online => "online",
-            Self::Offline => "offline",
-            Self::OnlineIfUncached => "online_if_uncached",
-        }
-    }
-}
-
-impl fmt::Display for RefreshStrategy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// How the manager's base catalog is sourced for the lifetime of the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatalogMode {
@@ -282,22 +168,6 @@ impl ModelsManager {
     /// When `model_catalog` is provided, it becomes the authoritative remote model list and
     /// background refreshes from `/models` are disabled.
     pub fn new(
-        codex_home: PathBuf,
-        auth_manager: Arc<AuthManager>,
-        model_catalog: Option<ModelsResponse>,
-        collaboration_modes_config: CollaborationModesConfig,
-    ) -> Self {
-        Self::new_with_provider(
-            codex_home,
-            auth_manager,
-            model_catalog,
-            collaboration_modes_config,
-            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
-        )
-    }
-
-    /// Construct a manager with an explicit provider used for remote model refreshes.
-    pub fn new_with_provider(
         codex_home: PathBuf,
         auth_manager: Arc<AuthManager>,
         model_catalog: Option<ModelsResponse>,
@@ -332,11 +202,6 @@ impl ModelsManager {
     /// List all available models, refreshing according to the specified strategy.
     ///
     /// Returns model presets sorted by priority and filtered by auth mode and visibility.
-    #[instrument(
-        level = "info",
-        skip(self),
-        fields(refresh_strategy = %refresh_strategy)
-    )]
     pub async fn list_models(&self, refresh_strategy: RefreshStrategy) -> Vec<ModelPreset> {
         if let Err(err) = self.refresh_available_models(refresh_strategy).await {
             error!("failed to refresh available models: {err}");
@@ -372,14 +237,6 @@ impl ModelsManager {
     ///
     /// If `model` is provided, returns it directly. Otherwise selects the default based on
     /// auth mode and available models.
-    #[instrument(
-        level = "info",
-        skip(self, model),
-        fields(
-            model.provided = model.is_some(),
-            refresh_strategy = %refresh_strategy
-        )
-    )]
     pub async fn get_default_model(
         &self,
         model: &Option<String>,
@@ -427,7 +284,6 @@ impl ModelsManager {
 
     // todo(aibrahim): look if we can tighten it to pub(crate)
     /// Look up model metadata, applying remote overrides and config adjustments.
-    #[instrument(level = "info", skip(self, config), fields(model = model))]
     pub async fn get_model_info(&self, model: &str, config: &Config) -> ModelInfo {
         let remote_models = self.get_remote_models().await;
         Self::construct_model_info_from_candidates(model, &remote_models, config)
@@ -575,27 +431,19 @@ impl ModelsManager {
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let client_version = crate::models_manager::client_version_to_whole();
         let auth = self.auth_manager.auth().await;
-        let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
+        let auth_mode = self.auth_manager.auth_mode();
         let api_provider = self.provider.to_api_provider(auth_mode)?;
         let models_and_etag = if self.provider.is_github_copilot_provider() {
             let api_auth = match auth_provider_from_auth(auth.clone(), &self.provider) {
                 Ok(api_auth) => api_auth,
                 Err(CodexErr::EnvVar(_)) => {
                     info!("models refresh skipped: github-copilot token is unavailable");
-                    // Avoid showing bundled fallback models when the provider
-                    // cannot be authenticated.
-                    self.apply_remote_models(Vec::new()).await;
-                    *self.etag.write().await = None;
                     return Ok(());
                 }
                 Err(err) => return Err(err),
             };
             let Some(token) = api_auth.bearer_token() else {
                 info!("models refresh skipped: github-copilot auth token is unavailable");
-                // Avoid showing bundled fallback models when the provider
-                // cannot be authenticated.
-                self.apply_remote_models(Vec::new()).await;
-                *self.etag.write().await = None;
                 return Ok(());
             };
 
@@ -670,14 +518,8 @@ impl ModelsManager {
             }
         } else {
             let api_auth = auth_provider_from_auth(auth, &self.provider)?;
-            let auth_mode = auth_mode.map(|mode| TelemetryAuthMode::from(mode).to_string());
-            self.fetch_models_from_provider_api(
-                api_auth,
-                api_provider,
-                client_version.clone(),
-                auth_mode,
-            )
-            .await?
+            self.fetch_models_from_provider_api(api_auth, api_provider, client_version.clone())
+                .await?
         };
         let (models, etag) = models_and_etag;
 
@@ -722,13 +564,12 @@ impl ModelsManager {
             .json()
             .await
             .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
-        let mut models = payload
+        let model_ids = payload
             .data
             .into_iter()
-            .filter(OpenAiCompatModel::is_picker_enabled)
+            .filter(|model| model.is_picker_enabled())
+            .map(|model| model.id)
             .collect::<Vec<_>>();
-        models.sort_by_key(|model| !model.supports_responses_endpoint());
-        let model_ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
         let models = self.map_provider_model_ids(model_ids);
         Ok((models, etag))
     }
@@ -788,7 +629,7 @@ impl ModelsManager {
         let model_ids = payload
             .models
             .into_iter()
-            .filter(OllamaTagsModel::is_picker_enabled)
+            .filter(|model| model.is_picker_enabled())
             .map(|model| model.name)
             .collect::<Vec<_>>();
         let models = self.map_provider_model_ids(model_ids);
@@ -800,16 +641,9 @@ impl ModelsManager {
         api_auth: CoreAuthProvider,
         api_provider: codex_api::Provider,
         client_version: String,
-        auth_mode: Option<String>,
     ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
         let transport = ReqwestTransport::new(build_reqwest_client());
-        let request_telemetry: Arc<dyn RequestTelemetry> = Arc::new(ModelsRequestTelemetry {
-            auth_mode,
-            auth_header_attached: api_auth.auth_header_attached(),
-            auth_header_name: api_auth.auth_header_name(),
-        });
-        let client = ModelsClient::new(transport, api_provider, api_auth)
-            .with_telemetry(Some(request_telemetry));
+        let client = ModelsClient::new(transport, api_provider, api_auth);
 
         timeout(
             MODELS_REFRESH_TIMEOUT,
@@ -884,17 +718,14 @@ impl ModelsManager {
         &self,
         catalog: &'a HashMap<String, ModelsDevProvider>,
     ) -> Option<(&'a str, &'a ModelsDevProvider)> {
-        for provider_alias in self.models_dev_provider_aliases() {
-            if let Some((provider_id, provider)) = catalog.get_key_value(&provider_alias) {
-                return Some((provider_id.as_str(), provider));
-            }
+        let normalized_name = Self::normalize_provider_key(&self.provider.name);
+        if let Some((provider_id, provider)) = catalog.get_key_value(&normalized_name) {
+            return Some((provider_id.as_str(), provider));
         }
-        if let Some((provider_id, provider)) = catalog.iter().find(|(_, provider)| {
-            let normalized_provider_name = Self::normalize_provider_key(&provider.name);
-            self.models_dev_provider_aliases()
-                .iter()
-                .any(|alias| alias == &normalized_provider_name)
-        }) {
+        if let Some((provider_id, provider)) = catalog
+            .iter()
+            .find(|(_, provider)| Self::normalize_provider_key(&provider.name) == normalized_name)
+        {
             return Some((provider_id.as_str(), provider));
         }
 
@@ -920,26 +751,6 @@ impl ModelsManager {
             return None;
         }
         Some((first_match.0.as_str(), first_match.1))
-    }
-
-    fn models_dev_provider_aliases(&self) -> Vec<String> {
-        let normalized_provider_name = Self::normalize_provider_key(&self.provider.name);
-        let mut aliases = vec![normalized_provider_name.clone()];
-        let azure_named_provider = normalized_provider_name
-            .split('-')
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|window| window == ["azure", "openai"]);
-        if (azure_named_provider
-            || is_azure_responses_wire_base_url(
-                &self.provider.name,
-                self.provider.base_url.as_deref(),
-            ))
-            && !aliases.iter().any(|alias| alias == "azure")
-        {
-            aliases.push("azure".to_string());
-        }
-        aliases
     }
 
     fn map_models_dev_provider(&self, provider: &ModelsDevProvider) -> Vec<ModelInfo> {
@@ -988,7 +799,7 @@ impl ModelsManager {
     fn extract_host_from_url(input: &str) -> Option<String> {
         reqwest::Url::parse(input)
             .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
     }
 
     fn ollama_tags_url(base_url: &str) -> String {
@@ -1231,9 +1042,7 @@ impl ModelsManager {
 }
 
 #[cfg(test)]
-#[path = "manager_tests.rs"]
-mod tests;
-/*
+mod tests {
     use super::*;
     use crate::CodexAuth;
     use crate::auth::AuthCredentialsStoreMode;
@@ -1822,40 +1631,6 @@ mod tests;
                 .iter()
                 .any(|preset| preset.model == "claude-3.7-sonnet"),
             "expected claude-3.7-sonnet to be listed"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_available_models_clears_copilot_catalog_when_token_is_unavailable() {
-        let codex_home = tempdir().expect("temp dir");
-        let auth_manager = Arc::new(AuthManager::new(
-            codex_home.path().to_path_buf(),
-            false,
-            AuthCredentialsStoreMode::File,
-        ));
-        let mut provider = ModelProviderInfo::create_github_copilot_provider();
-        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
-        let manager = ModelsManager::with_provider_for_tests(
-            codex_home.path().to_path_buf(),
-            auth_manager,
-            provider,
-        );
-
-        manager
-            .refresh_available_models(RefreshStrategy::OnlineIfUncached)
-            .await
-            .expect("refresh should complete even without token");
-
-        let available = manager
-            .try_list_models()
-            .expect("models should be available");
-        assert!(
-            available.is_empty(),
-            "expected no github-copilot models without token, got: {:?}",
-            available
-                .iter()
-                .map(|preset| preset.model.as_str())
-                .collect::<Vec<_>>()
         );
     }
 
@@ -2547,72 +2322,6 @@ mod tests;
     }
 
     #[tokio::test]
-    async fn models_dev_provider_match_accepts_azure_openai_alias() {
-        let models_dev_server = MockServer::start().await;
-        let _models_dev = wiremock::Mock::given(method("GET"))
-            .and(path("/api.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "azure": {
-                    "id": "azure",
-                    "name": "Azure",
-                    "models": {
-                        "azure-model-a": {
-                            "id": "azure-model-a",
-                            "name": "Azure Model A",
-                            "release_date": "2026-01-01",
-                            "attachment": false,
-                            "reasoning": true,
-                            "temperature": true,
-                            "tool_call": true,
-                            "limit": {"context": 128000, "output": 4096},
-                            "options": {}
-                        }
-                    }
-                }
-            })))
-            .expect(1)
-            .mount_as_scoped(&models_dev_server)
-            .await;
-
-        let codex_home = tempdir().expect("temp dir");
-        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
-        let provider = ModelProviderInfo {
-            name: "Azure OpenAI".to_string(),
-            base_url: Some("http://127.0.0.1:9/openai".to_string()),
-            env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
-            env_key_instructions: None,
-            experimental_bearer_token: None,
-            wire_api: WireApi::Responses,
-            query_params: Some(
-                [("api-version".to_string(), "2025-04-01-preview".to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
-            http_headers: None,
-            env_http_headers: None,
-            request_max_retries: Some(0),
-            stream_max_retries: Some(0),
-            stream_idle_timeout_ms: Some(5_000),
-            requires_openai_auth: false,
-            supports_websockets: false,
-        };
-        let manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
-            codex_home.path().to_path_buf(),
-            auth_manager,
-            provider,
-            format!("{}/api.json", models_dev_server.uri()),
-        );
-
-        let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
-        assert!(
-            available
-                .iter()
-                .any(|preset| preset.model == "azure-model-a"),
-            "expected Azure OpenAI alias to match models.dev Azure provider"
-        );
-    }
-
-    #[tokio::test]
     async fn non_openai_provider_falls_back_to_provider_models_when_models_dev_has_no_match() {
         let models_dev_server = MockServer::start().await;
         let _models_dev = wiremock::Mock::given(method("GET"))
@@ -2785,4 +2494,3 @@ mod tests;
         );
     }
 }
-*/
