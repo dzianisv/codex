@@ -13,6 +13,9 @@ use std::io::Write;
 use std::net::TcpListener;
 use tempfile::tempdir;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
     remote_model_with_visibility(slug, display, priority, "list")
@@ -62,7 +65,7 @@ fn assert_models_contain(actual: &[ModelInfo], expected: &[ModelInfo]) {
 
 fn provider_for(base_url: String) -> ModelProviderInfo {
     ModelProviderInfo {
-        name: "mock".into(),
+        name: "OpenAI".into(),
         base_url: Some(base_url),
         env_key: None,
         env_key_instructions: None,
@@ -654,5 +657,245 @@ fn bundled_models_json_roundtrips() {
     assert!(
         !response.models.is_empty(),
         "bundled models.json should contain at least one model"
+    );
+}
+
+#[tokio::test]
+async fn non_openai_provider_ignores_cross_provider_cache_and_uses_models_dev_catalog() {
+    let codex_home = tempdir().expect("temp dir");
+    let copilot_auth =
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
+    let mut copilot_provider = ModelProviderInfo::create_github_copilot_provider();
+    copilot_provider.base_url = Some("https://api.githubcopilot.com".to_string());
+    let copilot_manager = ModelsManager::with_provider_for_tests(
+        codex_home.path().to_path_buf(),
+        copilot_auth,
+        copilot_provider,
+    );
+
+    let leaked_slug = "copilot-cache-only-model";
+    copilot_manager
+        .cache_manager
+        .persist_cache(
+            &[remote_model(leaked_slug, "Leaked", 0)],
+            None,
+            crate::models_manager::client_version_to_whole(),
+            copilot_manager.cache_scope_key(),
+        )
+        .await;
+
+    let models_dev_server = MockServer::start().await;
+    let _models_dev = wiremock::Mock::given(method("GET"))
+        .and(path("/api.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "azure": {
+                "id": "azure",
+                "name": "Azure",
+                "api": "https://azure.example.com/openai",
+                "env": ["AZURE_OPENAI_API_KEY"],
+                "models": {
+                    "azure-model-a": {
+                        "id": "azure-model-a",
+                        "name": "Azure Model A",
+                        "release_date": "2026-01-01",
+                        "attachment": false,
+                        "reasoning": true,
+                        "temperature": true,
+                        "tool_call": true,
+                        "limit": {"context": 128000, "output": 4096},
+                        "options": {}
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount_as_scoped(&models_dev_server)
+        .await;
+
+    let azure_auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("azure-key"));
+    let azure_provider = ModelProviderInfo {
+        name: "Azure".to_string(),
+        base_url: Some("https://azure.example.com/openai".to_string()),
+        env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: Some(
+            [("api-version".to_string(), "2025-04-01-preview".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+    let azure_manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
+        codex_home.path().to_path_buf(),
+        azure_auth,
+        azure_provider,
+        format!("{}/api.json", models_dev_server.uri()),
+    );
+
+    let available = azure_manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await;
+    assert!(
+        !available.iter().any(|preset| preset.model == leaked_slug),
+        "non-openai providers must ignore cache entries from github-copilot scope"
+    );
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "azure-model-a"),
+        "expected models.dev-discovered model to be listed"
+    );
+    assert!(
+        !available
+            .iter()
+            .any(|preset| preset.model.starts_with("gpt-")),
+        "non-openai provider should use authoritative models.dev catalog, not bundled OpenAI catalog"
+    );
+}
+
+#[tokio::test]
+async fn models_dev_provider_match_uses_base_url_host_when_name_is_custom() {
+    let models_dev_server = MockServer::start().await;
+    let _models_dev = wiremock::Mock::given(method("GET"))
+        .and(path("/api.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "anthropic": {
+                "id": "anthropic",
+                "name": "Anthropic",
+                "api": "https://api.anthropic.com/v1",
+                "env": ["ANTHROPIC_API_KEY"],
+                "models": {
+                    "claude-host-match": {
+                        "id": "claude-host-match",
+                        "name": "Claude Host Match",
+                        "release_date": "2026-01-01",
+                        "attachment": false,
+                        "reasoning": true,
+                        "temperature": true,
+                        "tool_call": true,
+                        "limit": {"context": 200000, "output": 4096},
+                        "options": {}
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount_as_scoped(&models_dev_server)
+        .await;
+
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+    let provider = ModelProviderInfo {
+        name: "Internal Anthropic Proxy".to_string(),
+        base_url: Some("https://api.anthropic.com/v1".to_string()),
+        env_key: Some("ANTHROPIC_API_KEY".to_string()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+    let manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+        format!("{}/api.json", models_dev_server.uri()),
+    );
+
+    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "claude-host-match"),
+        "expected provider host fallback to match models.dev provider"
+    );
+}
+
+#[tokio::test]
+async fn non_openai_provider_falls_back_to_provider_models_when_models_dev_has_no_match() {
+    let models_dev_server = MockServer::start().await;
+    let _models_dev = wiremock::Mock::given(method("GET"))
+        .and(path("/api.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "unrelated": {
+                "id": "unrelated",
+                "name": "Unrelated Provider",
+                "api": "https://unrelated.example.com/v1",
+                "env": ["UNRELATED_KEY"],
+                "models": {}
+            }
+        })))
+        .expect(1)
+        .mount_as_scoped(&models_dev_server)
+        .await;
+
+    let provider_server = MockServer::start().await;
+    let _provider_models = wiremock::Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "provider-fallback-a"},
+                {"id": "provider-fallback-b"}
+            ]
+        })))
+        .expect(1)
+        .mount_as_scoped(&provider_server)
+        .await;
+
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("provider-token"));
+    let provider = ModelProviderInfo {
+        name: "Custom Provider".to_string(),
+        base_url: Some(format!("{}/v1", provider_server.uri())),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+    let manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+        format!("{}/api.json", models_dev_server.uri()),
+    );
+
+    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "provider-fallback-a"),
+        "expected fallback to provider /models endpoint when models.dev has no match"
+    );
+    assert!(
+        !available
+            .iter()
+            .any(|preset| preset.model.starts_with("gpt-")),
+        "provider-authoritative fallback should still avoid bundled OpenAI model bleed"
     );
 }

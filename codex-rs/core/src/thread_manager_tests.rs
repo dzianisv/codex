@@ -11,12 +11,44 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
+use std::env;
+use std::ffi::OsString;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::MockServer;
+
+static MODELS_DEV_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = env::var_os(key);
+        unsafe {
+            env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -271,6 +303,127 @@ async fn new_uses_active_github_copilot_provider_for_model_refresh() {
             .iter()
             .any(|preset| preset.model == "copilot-thread-model"),
         "expected Copilot provider refresh to populate the selected model"
+    );
+}
+
+#[tokio::test]
+async fn new_uses_active_custom_provider_for_model_refresh() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("listener address");
+    let provider_api = format!("http://{addr}/proxy/v1");
+    let models_dev_url = format!("http://{addr}/api.json");
+    let models_dev_body = serde_json::json!({
+        "azure": {
+            "id": "azure",
+            "name": "Azure OpenAI",
+            "api": provider_api,
+            "env": ["AZURE_TEST_KEY"],
+            "models": {
+                "azure-thread-model-a": {
+                    "id": "azure-thread-model-a",
+                    "name": "azure-thread-model-a",
+                    "release_date": "2026-01-01",
+                    "attachment": false,
+                    "reasoning": true,
+                    "temperature": true,
+                    "tool_call": true,
+                    "limit": {"context": 128000, "output": 4096},
+                    "options": {}
+                },
+                "azure-thread-model-b": {
+                    "id": "azure-thread-model-b",
+                    "name": "azure-thread-model-b",
+                    "release_date": "2026-01-01",
+                    "attachment": false,
+                    "reasoning": true,
+                    "temperature": true,
+                    "tool_call": true,
+                    "limit": {"context": 128000, "output": 4096},
+                    "options": {}
+                }
+            }
+        }
+    })
+    .to_string();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept /api.json connection");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            models_dev_body.len(),
+            models_dev_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write /api.json response");
+        request
+    });
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config();
+    config.codex_home = temp_dir.path().join("codex-home");
+    config.cwd = config.codex_home.clone();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    config.model_catalog = None;
+
+    let provider = ModelProviderInfo {
+        name: "Azure OpenAI".to_string(),
+        base_url: Some(format!("http://{addr}/proxy/v1")),
+        env_key: Some("AZURE_TEST_KEY".to_string()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: crate::WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+    config.model_provider_id = "azure-local".to_string();
+    config.model_provider = provider.clone();
+    config
+        .model_providers
+        .insert("azure-local".to_string(), provider);
+
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("azure-token"));
+    let _env_lock = MODELS_DEV_ENV_LOCK.lock().expect("lock models.dev env var");
+    let _models_dev_url = EnvVarGuard::set("CODEX_MODELS_DEV_URL", &models_dev_url);
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager,
+        SessionSource::Exec,
+        CollaborationModesConfig::default(),
+    );
+
+    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+    let request = server.join().expect("models.dev server should complete");
+
+    assert!(
+        request.starts_with("GET /api.json "),
+        "expected GET /api.json request, got:\n{request}"
+    );
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "azure-thread-model-b"),
+        "expected custom provider refresh to populate models.dev catalog"
     );
 }
 

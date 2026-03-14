@@ -1,7 +1,6 @@
 use crate::AuthManager;
 use crate::CodexAuth;
 use crate::ModelProviderInfo;
-use crate::OPENAI_PROVIDER_ID;
 use crate::agent::AgentControl;
 use crate::codex::Codex;
 use crate::codex::CodexSpawnArgs;
@@ -169,15 +168,11 @@ impl ThreadManager {
         collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
         let codex_home = config.codex_home.clone();
-        let openai_models_provider = config
-            .model_providers
-            .get(OPENAI_PROVIDER_ID)
-            .cloned()
-            .unwrap_or_else(|| ModelProviderInfo::create_openai_provider(/*base_url*/ None));
-        let models_provider = if config.model_provider.is_github_copilot_provider() {
-            config.model_provider.clone()
+        let configured_provider = config.model_providers.get(&config.model_provider_id).cloned();
+        let models_provider = if config.model_provider.is_openai() {
+            configured_provider.unwrap_or_else(|| config.model_provider.clone())
         } else {
-            openai_models_provider
+            config.model_provider.clone()
         };
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let plugins_manager = Arc::new(PluginsManager::new(codex_home.clone()));

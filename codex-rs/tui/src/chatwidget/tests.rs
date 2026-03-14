@@ -7805,7 +7805,7 @@ async fn model_popup_shows_all_copilot_subscription_models_including_gemini() {
     chat.auth_manager = codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key(
         "copilot-test-token",
     ));
-    chat.models_manager = Arc::new(ModelsManager::new(
+    chat.models_manager = Arc::new(ModelsManager::new_with_provider(
         chat.config.codex_home.clone(),
         chat.auth_manager.clone(),
         None,

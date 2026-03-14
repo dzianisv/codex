@@ -1,4 +1,5 @@
 use super::cache::ModelsCacheManager;
+use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::AuthManager;
@@ -30,6 +31,8 @@ use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
 use http::header::ETAG;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
@@ -47,6 +50,9 @@ const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const MODELS_ENDPOINT: &str = "/models";
+const DEFAULT_MODELS_DEV_CATALOG_URL: &str = "https://models.dev/api.json";
+const MODELS_DEV_URL_ENV_KEY: &str = "CODEX_MODELS_DEV_URL";
+
 #[derive(Clone)]
 struct ModelsRequestTelemetry {
     auth_mode: Option<String>,
@@ -160,6 +166,55 @@ impl OllamaTagsModel {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelsDevProvider {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    api: Option<String>,
+    #[serde(default)]
+    models: HashMap<String, ModelsDevModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsDevModel {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    model_picker_enabled: Option<bool>,
+    #[serde(default)]
+    options: HashMap<String, JsonValue>,
+}
+
+impl ModelsDevModel {
+    fn resolved_id(&self, fallback: &str) -> Option<String> {
+        let id = self.id.as_deref().unwrap_or(fallback).trim();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    }
+
+    fn is_picker_enabled(&self) -> bool {
+        let option_flag = self
+            .options
+            .get("model_picker_enabled")
+            .and_then(JsonValue::as_bool);
+        !matches!(self.model_picker_enabled.or(option_flag), Some(false))
+    }
+
+    fn is_deprecated(&self) -> bool {
+        self.status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+    }
+}
+
 /// Strategy for refreshing available models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshStrategy {
@@ -206,6 +261,7 @@ pub struct ModelsManager {
     etag: RwLock<Option<String>>,
     cache_manager: ModelsCacheManager,
     provider: ModelProviderInfo,
+    models_dev_api_url_override: Option<String>,
 }
 
 impl ModelsManager {
@@ -258,6 +314,7 @@ impl ModelsManager {
             etag: RwLock::new(None),
             cache_manager,
             provider,
+            models_dev_api_url_override: None,
         }
     }
 
@@ -318,7 +375,7 @@ impl ModelsManager {
         refresh_strategy: RefreshStrategy,
     ) -> String {
         if let Some(model) = model.as_ref() {
-            if self.provider.is_github_copilot_provider() {
+            if self.provider_catalog_is_authoritative() {
                 if let Err(err) = self.refresh_available_models(refresh_strategy).await {
                     error!("failed to refresh available models: {err}");
                 }
@@ -336,7 +393,8 @@ impl ModelsManager {
                     warn!(
                         requested_model = model,
                         fallback_model = fallback,
-                        "requested github-copilot model is unavailable; falling back to default"
+                        provider_name = %self.provider.name,
+                        "requested model is unavailable for provider; falling back to default"
                     );
                     return fallback;
                 }
@@ -444,14 +502,12 @@ impl ModelsManager {
             return Ok(());
         }
 
-        // Providers that manage their own model catalog on the server side
-        // (Copilot, ChatGPT) or locally (Ollama, LM Studio) proceed to the
-        // standard refresh/fetch logic below.  All other providers only use
-        // the bundled catalog.
-        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt)
-            && !self.provider.is_github_copilot_provider()
-            && !self.provider.is_local_oss_provider()
-        {
+        // OpenAI in API-key mode still relies on bundled catalog metadata.
+        // All other providers (ChatGPT, Copilot, local OSS, and non-OpenAI)
+        // should refresh from a provider-authoritative source.
+        let should_refresh_from_network = self.auth_manager.auth_mode() == Some(AuthMode::Chatgpt)
+            || self.provider_catalog_is_authoritative();
+        if !should_refresh_from_network {
             if matches!(
                 refresh_strategy,
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
@@ -491,10 +547,10 @@ impl ModelsManager {
         match self.fetch_and_update_models().await {
             Ok(()) => Ok(()),
             Err(err) => {
-                if self.provider.is_local_oss_provider() {
+                if self.provider_catalog_is_authoritative() {
                     warn!(
                         error = %err,
-                        "local OSS models refresh failed; clearing catalog to avoid bundled fallback models"
+                        "provider-authoritative models refresh failed; clearing catalog to avoid bundled fallback models"
                     );
                     self.apply_remote_models(Vec::new()).await;
                 }
@@ -564,24 +620,45 @@ impl ModelsManager {
                     }
                 }
             }
+        } else if !self.provider.is_openai() {
+            match self.fetch_models_from_models_dev().await {
+                Ok(Some(models_and_etag)) => models_and_etag,
+                Ok(None) => {
+                    info!(
+                        provider_name = %self.provider.name,
+                        "models.dev match not found; falling back to provider /models endpoint"
+                    );
+                    self.fetch_openai_compat_models_for_provider(
+                        auth.clone(),
+                        api_provider.clone(),
+                        "openai-compatible-provider",
+                    )
+                    .await?
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        provider_name = %self.provider.name,
+                        "models.dev lookup failed; falling back to provider /models endpoint"
+                    );
+                    self.fetch_openai_compat_models_for_provider(
+                        auth.clone(),
+                        api_provider.clone(),
+                        "openai-compatible-provider",
+                    )
+                    .await?
+                }
+            }
         } else {
-            let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
-            let transport = ReqwestTransport::new(build_reqwest_client());
-            let request_telemetry: Arc<dyn RequestTelemetry> = Arc::new(ModelsRequestTelemetry {
-                auth_mode: auth_mode.map(|mode| TelemetryAuthMode::from(mode).to_string()),
-                auth_header_attached: api_auth.auth_header_attached(),
-                auth_header_name: api_auth.auth_header_name(),
-            });
-            let client = ModelsClient::new(transport, api_provider, api_auth)
-                .with_telemetry(Some(request_telemetry));
-
-            timeout(
-                MODELS_REFRESH_TIMEOUT,
-                client.list_models(&client_version, HeaderMap::new()),
+            let api_auth = auth_provider_from_auth(auth, &self.provider)?;
+            let auth_mode = auth_mode.map(|mode| TelemetryAuthMode::from(mode).to_string());
+            self.fetch_models_from_provider_api(
+                api_auth,
+                api_provider,
+                client_version.clone(),
+                auth_mode,
             )
-            .await
-            .map_err(|_| CodexErr::Timeout)?
-            .map_err(map_api_error)?
+            .await?
         };
         let (models, etag) = models_and_etag;
 
@@ -636,6 +713,27 @@ impl ModelsManager {
         Ok((models, etag))
     }
 
+    async fn fetch_openai_compat_models_for_provider(
+        &self,
+        auth: Option<crate::CodexAuth>,
+        api_provider: codex_api::Provider,
+        provider_label: &str,
+    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        let url = format!("{}/models", api_provider.base_url.trim_end_matches('/'));
+        let api_auth = auth_provider_from_auth(auth, &self.provider)?;
+        let mut request = build_reqwest_client()
+            .get(url)
+            .headers(api_provider.headers);
+        if let Some(query_params) = api_provider.query_params.as_ref() {
+            request = request.query(query_params);
+        }
+        if let Some(token) = api_auth.bearer_token() {
+            request = request.bearer_auth(token);
+        }
+        self.fetch_openai_compat_models(request, provider_label)
+            .await
+    }
+
     async fn fetch_ollama_tags_models(
         &self,
         base_url: &str,
@@ -675,6 +773,179 @@ impl ModelsManager {
             .collect::<Vec<_>>();
         let models = self.map_provider_model_ids(model_ids);
         Ok((models, etag))
+    }
+
+    async fn fetch_models_from_provider_api(
+        &self,
+        api_auth: CoreAuthProvider,
+        api_provider: codex_api::Provider,
+        client_version: String,
+        auth_mode: Option<String>,
+    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        let transport = ReqwestTransport::new(build_reqwest_client());
+        let request_telemetry: Arc<dyn RequestTelemetry> = Arc::new(ModelsRequestTelemetry {
+            auth_mode,
+            auth_header_attached: api_auth.auth_header_attached(),
+            auth_header_name: api_auth.auth_header_name(),
+        });
+        let client = ModelsClient::new(transport, api_provider, api_auth)
+            .with_telemetry(Some(request_telemetry));
+
+        timeout(
+            MODELS_REFRESH_TIMEOUT,
+            client.list_models(&client_version, HeaderMap::new()),
+        )
+        .await
+        .map_err(|_| CodexErr::Timeout)?
+        .map_err(map_api_error)
+    }
+
+    async fn fetch_models_from_models_dev(
+        &self,
+    ) -> CoreResult<Option<(Vec<ModelInfo>, Option<String>)>> {
+        let catalog_url = self.models_dev_api_url();
+        let response = timeout(
+            MODELS_REFRESH_TIMEOUT,
+            build_reqwest_client().get(catalog_url.clone()).send(),
+        )
+        .await
+        .map_err(|_| CodexErr::Timeout)?
+        .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(CodexErr::Stream(
+                format!(
+                    "failed to fetch models.dev catalog from {catalog_url}: {status}; body: {body}"
+                ),
+                None,
+            ));
+        }
+        let payload: HashMap<String, ModelsDevProvider> = response
+            .json()
+            .await
+            .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
+        let Some((provider_id, provider)) = self.match_models_dev_provider(&payload) else {
+            return Ok(None);
+        };
+        let models = self.map_models_dev_provider(provider);
+        info!(
+            provider_name = %self.provider.name,
+            models_dev_provider_id = provider_id,
+            models_count = models.len(),
+            "using models.dev provider catalog for model picker"
+        );
+        Ok(Some((models, etag)))
+    }
+
+    fn models_dev_api_url(&self) -> String {
+        let raw = self
+            .models_dev_api_url_override
+            .clone()
+            .or_else(|| std::env::var(MODELS_DEV_URL_ENV_KEY).ok())
+            .unwrap_or_else(|| DEFAULT_MODELS_DEV_CATALOG_URL.to_string());
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return DEFAULT_MODELS_DEV_CATALOG_URL.to_string();
+        }
+        if trimmed.ends_with(".json") {
+            trimmed.to_string()
+        } else {
+            format!("{}/api.json", trimmed.trim_end_matches('/'))
+        }
+    }
+
+    fn match_models_dev_provider<'a>(
+        &self,
+        catalog: &'a HashMap<String, ModelsDevProvider>,
+    ) -> Option<(&'a str, &'a ModelsDevProvider)> {
+        let normalized_name = Self::normalize_provider_key(&self.provider.name);
+        if let Some((provider_id, provider)) = catalog.get_key_value(&normalized_name) {
+            return Some((provider_id.as_str(), provider));
+        }
+        if let Some((provider_id, provider)) = catalog
+            .iter()
+            .find(|(_, provider)| Self::normalize_provider_key(&provider.name) == normalized_name)
+        {
+            return Some((provider_id.as_str(), provider));
+        }
+
+        let provider_host = self
+            .provider
+            .base_url
+            .as_deref()
+            .and_then(Self::extract_host_from_url)?;
+        let mut host_matches = catalog.iter().filter(|(_, provider)| {
+            provider
+                .api
+                .as_deref()
+                .and_then(Self::extract_host_from_url)
+                .is_some_and(|host| host == provider_host)
+        });
+        let first_match = host_matches.next()?;
+        if host_matches.next().is_some() {
+            warn!(
+                provider_name = %self.provider.name,
+                provider_host = %provider_host,
+                "multiple models.dev providers matched provider host; skipping host fallback match"
+            );
+            return None;
+        }
+        Some((first_match.0.as_str(), first_match.1))
+    }
+
+    fn map_models_dev_provider(&self, provider: &ModelsDevProvider) -> Vec<ModelInfo> {
+        let mut metadata_by_slug: HashMap<String, &ModelsDevModel> = HashMap::new();
+        let mut model_ids = provider
+            .models
+            .iter()
+            .filter_map(|(model_key, model)| {
+                if model.is_deprecated() || !model.is_picker_enabled() {
+                    return None;
+                }
+                let id = model.resolved_id(model_key)?;
+                metadata_by_slug.insert(id.clone(), model);
+                Some(id)
+            })
+            .collect::<Vec<_>>();
+        model_ids.sort();
+
+        let mut mapped = self.map_provider_model_ids(model_ids);
+        for model in &mut mapped {
+            if let Some(metadata) = metadata_by_slug.get(&model.slug)
+                && let Some(name) = metadata.name.as_deref()
+                && !name.trim().is_empty()
+            {
+                model.display_name = name.to_string();
+            }
+        }
+        mapped
+    }
+
+    fn normalize_provider_key(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut last_was_dash = false;
+        for ch in input.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+                last_was_dash = false;
+            } else if !last_was_dash {
+                out.push('-');
+                last_was_dash = true;
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    fn extract_host_from_url(input: &str) -> Option<String> {
+        reqwest::Url::parse(input)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
     }
 
     fn ollama_tags_url(base_url: &str) -> String {
@@ -718,6 +989,12 @@ impl ModelsManager {
         self.etag.read().await.clone()
     }
 
+    fn provider_catalog_is_authoritative(&self) -> bool {
+        self.provider.is_github_copilot_provider()
+            || self.provider.is_local_oss_provider()
+            || !self.provider.is_openai()
+    }
+
     fn cache_scope_key(&self) -> String {
         let auth_mode = self.auth_manager.auth_mode();
         let base_url = self
@@ -733,13 +1010,9 @@ impl ModelsManager {
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
-        let next_models = if self.provider.is_github_copilot_provider()
-            || self.provider.is_local_oss_provider()
-        {
-            // Copilot and local OSS providers return their own definitive
-            // model list via an OpenAI-compat endpoint.  Use that list
-            // as-is instead of merging with the bundled models.json
-            // (which only contains OpenAI models).
+        let next_models = if self.provider_catalog_is_authoritative() {
+            // Copilot/local-OSS/non-OpenAI providers return an authoritative
+            // catalog (provider endpoint or models.dev); use it as-is.
             models
         } else {
             let mut existing_models = Self::load_remote_models_from_file().unwrap_or_default();
@@ -833,7 +1106,20 @@ impl ModelsManager {
             etag: RwLock::new(None),
             cache_manager,
             provider,
+            models_dev_api_url_override: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_provider_and_models_dev_url_for_tests(
+        codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        provider: ModelProviderInfo,
+        models_dev_api_url: String,
+    ) -> Self {
+        let mut manager = Self::with_provider_for_tests(codex_home, auth_manager, provider);
+        manager.models_dev_api_url_override = Some(models_dev_api_url);
+        manager
     }
 
     fn inject_test_models(models: &mut Vec<ModelInfo>) {
@@ -970,7 +1256,7 @@ mod tests;
 
     fn provider_for(base_url: String) -> ModelProviderInfo {
         ModelProviderInfo {
-            name: "mock".into(),
+            name: "OpenAI".into(),
             base_url: Some(base_url),
             env_key: None,
             env_key_instructions: None,
@@ -2019,7 +2305,7 @@ mod tests;
     }
 
     #[tokio::test]
-    async fn online_if_uncached_ignores_cache_from_other_provider_for_openai_compatible() {
+    async fn non_openai_provider_ignores_cross_provider_cache_and_uses_models_dev_catalog() {
         let codex_home = tempdir().expect("temp dir");
         let copilot_auth =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("copilot-test-token"));
@@ -2040,6 +2326,34 @@ mod tests;
                 crate::models_manager::client_version_to_whole(),
                 copilot_manager.cache_scope_key(),
             )
+            .await;
+
+        let models_dev_server = MockServer::start().await;
+        let _models_dev = wiremock::Mock::given(method("GET"))
+            .and(path("/api.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "azure": {
+                    "id": "azure",
+                    "name": "Azure",
+                    "api": "https://azure.example.com/openai",
+                    "env": ["AZURE_OPENAI_API_KEY"],
+                    "models": {
+                        "azure-model-a": {
+                            "id": "azure-model-a",
+                            "name": "Azure Model A",
+                            "release_date": "2026-01-01",
+                            "attachment": false,
+                            "reasoning": true,
+                            "temperature": true,
+                            "tool_call": true,
+                            "limit": {"context": 128000, "output": 4096},
+                            "options": {}
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&models_dev_server)
             .await;
 
         let azure_auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("azure-key"));
@@ -2063,10 +2377,11 @@ mod tests;
             requires_openai_auth: false,
             supports_websockets: false,
         };
-        let azure_manager = ModelsManager::with_provider_for_tests(
+        let azure_manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
             codex_home.path().to_path_buf(),
             azure_auth,
             azure_provider,
+            format!("{}/api.json", models_dev_server.uri()),
         );
 
         let available = azure_manager
@@ -2074,20 +2389,155 @@ mod tests;
             .await;
         assert!(
             !available.iter().any(|preset| preset.model == leaked_slug),
-            "azure/openai-compatible provider must ignore cache entries from github-copilot scope"
+            "non-openai providers must ignore cache entries from github-copilot scope"
         );
-
-        let bundled_default_slug = ModelsManager::load_remote_models_from_file()
-            .expect("bundled models should load")
-            .first()
-            .expect("bundled catalog should have at least one model")
-            .slug
-            .clone();
         assert!(
             available
                 .iter()
-                .any(|preset| preset.model == bundled_default_slug),
-            "azure/openai-compatible provider should keep bundled catalog when cache is mismatched"
+                .any(|preset| preset.model == "azure-model-a"),
+            "expected models.dev-discovered model to be listed"
+        );
+        assert!(
+            !available
+                .iter()
+                .any(|preset| preset.model.starts_with("gpt-")),
+            "non-openai provider should use authoritative models.dev catalog, not bundled OpenAI catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_dev_provider_match_uses_base_url_host_when_name_is_custom() {
+        let models_dev_server = MockServer::start().await;
+        let _models_dev = wiremock::Mock::given(method("GET"))
+            .and(path("/api.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "anthropic": {
+                    "id": "anthropic",
+                    "name": "Anthropic",
+                    "api": "https://api.anthropic.com/v1",
+                    "env": ["ANTHROPIC_API_KEY"],
+                    "models": {
+                        "claude-host-match": {
+                            "id": "claude-host-match",
+                            "name": "Claude Host Match",
+                            "release_date": "2026-01-01",
+                            "attachment": false,
+                            "reasoning": true,
+                            "temperature": true,
+                            "tool_call": true,
+                            "limit": {"context": 200000, "output": 4096},
+                            "options": {}
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&models_dev_server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+        let provider = ModelProviderInfo {
+            name: "Internal Anthropic Proxy".to_string(),
+            base_url: Some("https://api.anthropic.com/v1".to_string()),
+            env_key: Some("ANTHROPIC_API_KEY".to_string()),
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            stream_idle_timeout_ms: Some(5_000),
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+        let manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+            format!("{}/api.json", models_dev_server.uri()),
+        );
+
+        let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "claude-host-match"),
+            "expected provider host fallback to match models.dev provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_openai_provider_falls_back_to_provider_models_when_models_dev_has_no_match() {
+        let models_dev_server = MockServer::start().await;
+        let _models_dev = wiremock::Mock::given(method("GET"))
+            .and(path("/api.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "unrelated": {
+                    "id": "unrelated",
+                    "name": "Unrelated Provider",
+                    "api": "https://unrelated.example.com/v1",
+                    "env": ["UNRELATED_KEY"],
+                    "models": {}
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&models_dev_server)
+            .await;
+
+        let provider_server = MockServer::start().await;
+        let _provider_models = wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": "provider-fallback-a"},
+                    {"id": "provider-fallback-b"}
+                ]
+            })))
+            .expect(1)
+            .mount_as_scoped(&provider_server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("provider-token"));
+        let provider = ModelProviderInfo {
+            name: "Custom Provider".to_string(),
+            base_url: Some(format!("{}/v1", provider_server.uri())),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            stream_idle_timeout_ms: Some(5_000),
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+        let manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+            format!("{}/api.json", models_dev_server.uri()),
+        );
+
+        let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "provider-fallback-a"),
+            "expected fallback to provider /models endpoint when models.dev has no match"
+        );
+        assert!(
+            !available
+                .iter()
+                .any(|preset| preset.model.starts_with("gpt-")),
+            "provider-authoritative fallback should still avoid bundled OpenAI model bleed"
         );
     }
 

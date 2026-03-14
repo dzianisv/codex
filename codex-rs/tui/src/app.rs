@@ -43,9 +43,6 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
-use codex_core::GITHUB_COPILOT_PROVIDER_ID;
-use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
-use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -157,28 +154,41 @@ fn guardian_approvals_mode() -> GuardianApprovalsMode {
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
 
+fn effective_provider_info<'a>(
+    config: &'a Config,
+    provider_id: &str,
+) -> Option<&'a codex_core::ModelProviderInfo> {
+    let configured_provider = config.model_providers.get(provider_id);
+    if provider_id != config.model_provider_id {
+        return configured_provider;
+    }
+
+    if config.model_provider.is_openai() {
+        configured_provider.or(Some(&config.model_provider))
+    } else {
+        Some(&config.model_provider)
+    }
+}
+
+fn provider_uses_authoritative_catalog(config: &Config, provider_id: &str) -> bool {
+    effective_provider_info(config, provider_id).is_some_and(|provider| !provider.is_openai())
+}
+
 fn startup_models_refresh_strategy(config: &Config) -> RefreshStrategy {
-    if config.model_provider_id == GITHUB_COPILOT_PROVIDER_ID
-        || config.model_provider_id == OLLAMA_OSS_PROVIDER_ID
-        || config.model_provider_id == LMSTUDIO_OSS_PROVIDER_ID
-    {
-        // These providers expose authoritative `/models` endpoints:
+    if provider_uses_authoritative_catalog(config, &config.model_provider_id) {
+        // Non-OpenAI providers can expose runtime-dependent catalogs:
         // - Copilot: server-side model availability changes over time.
         // - Ollama / LM Studio: installed local models can change at runtime.
+        // - Other providers: models.dev/provider APIs are authoritative.
         RefreshStrategy::OnlineIfUncached
     } else {
         RefreshStrategy::Offline
     }
 }
 
-fn model_picker_refresh_strategy(provider_id: &str) -> RefreshStrategy {
-    if provider_id == GITHUB_COPILOT_PROVIDER_ID
-        || provider_id == OLLAMA_OSS_PROVIDER_ID
-        || provider_id == LMSTUDIO_OSS_PROVIDER_ID
-    {
-        // Keep these lists fresh in `/model` so models show up:
-        // - Copilot: newly supported models appear server-side.
-        // - Ollama / LM Studio: user installs/removes models locally.
+fn model_picker_refresh_strategy(config: &Config, provider_id: &str) -> RefreshStrategy {
+    if provider_uses_authoritative_catalog(config, provider_id) {
+        // Keep provider-authoritative lists fresh in `/model`.
         RefreshStrategy::OnlineIfUncached
     } else {
         RefreshStrategy::Offline
@@ -972,25 +982,23 @@ impl App {
 
         let mut presets = Vec::new();
         for provider_id in provider_ids {
-            let refresh_strategy = model_picker_refresh_strategy(provider_id.as_str());
-            let provider_models = if provider_id == active_provider_id {
-                self.server
-                    .get_models_manager()
-                    .list_models(refresh_strategy)
-                    .await
-            } else {
-                let Some(provider) = self.config.model_providers.get(&provider_id).cloned() else {
-                    continue;
-                };
-                let manager = ModelsManager::new_with_provider(
-                    self.config.codex_home.clone(),
-                    self.auth_manager.clone(),
-                    None,
-                    CollaborationModesConfig::default(),
-                    provider,
-                );
-                manager.list_models(refresh_strategy).await
+            let refresh_strategy =
+                model_picker_refresh_strategy(&self.config, provider_id.as_str());
+            let provider = effective_provider_info(&self.config, provider_id.as_str()).cloned();
+            let Some(provider) = provider else {
+                continue;
             };
+            let model_catalog = (provider_id == active_provider_id)
+                .then(|| self.config.model_catalog.clone())
+                .flatten();
+            let manager = ModelsManager::new_with_provider(
+                self.config.codex_home.clone(),
+                self.auth_manager.clone(),
+                model_catalog,
+                CollaborationModesConfig::default(),
+                provider,
+            );
+            let provider_models = manager.list_models(refresh_strategy).await;
             presets.extend(
                 provider_models
                     .into_iter()
@@ -4374,6 +4382,9 @@ mod tests {
     use crate::multi_agents::AgentPickerThreadEntry;
     use assert_matches::assert_matches;
     use codex_core::CodexAuth;
+    use codex_core::GITHUB_COPILOT_PROVIDER_ID;
+    use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
+    use codex_core::OLLAMA_OSS_PROVIDER_ID;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::types::ModelAvailabilityNuxConfig;
@@ -4384,6 +4395,7 @@ mod tests {
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
     use codex_protocol::openai_models::ModelAvailabilityNux;
+    use codex_protocol::openai_models::ModelsResponse;
     use codex_protocol::protocol::AgentMessageDeltaEvent;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::Event;
@@ -4403,14 +4415,47 @@ mod tests {
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
+    use serial_test::serial;
+    use std::env;
+    use std::ffi::OsString;
     use std::io::Read;
     use std::io::Write;
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
     use tokio::time;
+
+    static MODELS_DEV_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn normalize_harness_overrides_resolves_relative_add_dirs() -> Result<()> {
@@ -4494,28 +4539,238 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn model_picker_refresh_fetches_remote_for_github_copilot() {
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_github_copilot() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
         assert_eq!(
-            model_picker_refresh_strategy(GITHUB_COPILOT_PROVIDER_ID),
+            model_picker_refresh_strategy(&config, GITHUB_COPILOT_PROVIDER_ID),
             RefreshStrategy::OnlineIfUncached
         );
+        Ok(())
     }
 
-    #[test]
-    fn model_picker_refresh_fetches_remote_for_ollama() {
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_ollama() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
         assert_eq!(
-            model_picker_refresh_strategy(OLLAMA_OSS_PROVIDER_ID),
+            model_picker_refresh_strategy(&config, OLLAMA_OSS_PROVIDER_ID),
             RefreshStrategy::OnlineIfUncached
         );
+        Ok(())
     }
 
-    #[test]
-    fn model_picker_refresh_fetches_remote_for_lmstudio() {
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_lmstudio() -> Result<()> {
+        let codex_home = tempdir()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
         assert_eq!(
-            model_picker_refresh_strategy(LMSTUDIO_OSS_PROVIDER_ID),
+            model_picker_refresh_strategy(&config, LMSTUDIO_OSS_PROVIDER_ID),
             RefreshStrategy::OnlineIfUncached
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_picker_refresh_fetches_remote_for_custom_non_openai_provider() -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.model_provider_id = "azure-local".to_string();
+        config.model_providers.insert(
+            "azure-local".to_string(),
+            codex_core::ModelProviderInfo {
+                name: "Azure".to_string(),
+                base_url: Some("https://example.azure.test/v1".to_string()),
+                env_key: Some("AZURE_TEST_KEY".to_string()),
+                env_key_instructions: None,
+                experimental_bearer_token: None,
+                wire_api: codex_core::WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                websocket_connect_timeout_ms: None,
+                requires_openai_auth: false,
+                supports_websockets: false,
+            },
+        );
+
+        assert_eq!(
+            model_picker_refresh_strategy(&config, "azure-local"),
+            RefreshStrategy::OnlineIfUncached
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_picker_refresh_prefers_effective_active_provider_over_stale_provider_map()
+    -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.model_provider_id = "azure-local".to_string();
+        config.model_provider = codex_core::ModelProviderInfo {
+            name: "Azure OpenAI".to_string(),
+            base_url: Some("https://proxy.local/v1".to_string()),
+            env_key: Some("AZURE_TEST_KEY".to_string()),
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: codex_core::WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+        config.model_providers.insert(
+            "azure-local".to_string(),
+            codex_core::ModelProviderInfo::create_openai_provider(None),
+        );
+
+        assert_eq!(
+            startup_models_refresh_strategy(&config),
+            RefreshStrategy::OnlineIfUncached
+        );
+        assert_eq!(
+            model_picker_refresh_strategy(&config, "azure-local"),
+            RefreshStrategy::OnlineIfUncached
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provider_model_presets_for_picker_prefers_effective_active_provider_over_stale_provider_map()
+    -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let models_dev_url = format!("http://{addr}/api.json");
+        let models_dev_body = serde_json::json!({
+            "azure": {
+                "id": "azure",
+                "name": "Azure OpenAI",
+                "api": format!("http://{addr}/proxy/v1"),
+                "models": {
+                    "azure-model-a": {
+                        "id": "azure-model-a",
+                        "name": "azure-model-a",
+                        "release_date": "2026-01-01",
+                        "attachment": false,
+                        "reasoning": true,
+                        "temperature": true,
+                        "tool_call": true,
+                        "limit": {"context": 128000, "output": 4096},
+                        "options": {}
+                    },
+                    "azure-model-b": {
+                        "id": "azure-model-b",
+                        "name": "azure-model-b",
+                        "release_date": "2026-01-01",
+                        "attachment": false,
+                        "reasoning": true,
+                        "temperature": true,
+                        "tool_call": true,
+                        "limit": {"context": 128000, "output": 4096},
+                        "options": {}
+                    }
+                }
+            }
+        })
+        .to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept /api.json connection");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let bytes_read = stream.read(&mut chunk).expect("read request bytes");
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let request = String::from_utf8_lossy(&request).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                models_dev_body.len(),
+                models_dev_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write /api.json response");
+            request
+        });
+
+        let mut app = make_test_app().await;
+        app.auth_manager = codex_core::test_support::auth_manager_from_auth(
+            CodexAuth::from_api_key("azure-test-token"),
+        );
+
+        let active_provider = codex_core::ModelProviderInfo {
+            name: "Azure OpenAI".to_string(),
+            base_url: Some(format!("http://{addr}/proxy/v1")),
+            env_key: Some("AZURE_TEST_KEY".to_string()),
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: codex_core::WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+        app.config.model_provider_id = "azure-local".to_string();
+        app.config.model_provider = active_provider;
+        app.config.model_providers = HashMap::from([(
+            "azure-local".to_string(),
+            codex_core::ModelProviderInfo::create_openai_provider(None),
+        )]);
+
+        let _env_lock = MODELS_DEV_ENV_LOCK.lock().expect("lock models.dev env var");
+        let _models_dev_url = EnvVarGuard::set("CODEX_MODELS_DEV_URL", &models_dev_url);
+
+        let presets = app.provider_model_presets_for_picker().await;
+        let request = server.join().expect("models.dev server should complete");
+
+        assert!(
+            request.starts_with("GET /api.json "),
+            "expected GET /api.json request, got:\n{request}"
+        );
+        assert!(
+            presets.iter().any(|preset| {
+                preset.provider_id == "azure-local" && preset.model.model == "azure-model-b"
+            }),
+            "expected active provider picker refresh to use effective custom provider"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -4589,6 +4844,42 @@ mod tests {
                     && preset.model.model == "gemini-3-pro"
             }),
             "expected gemini-3-pro in Copilot provider presets"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_model_presets_for_picker_preserves_active_custom_catalog() -> Result<()> {
+        let mut app = make_test_app().await;
+        let provider_id = "copilot-local".to_string();
+        let provider = codex_core::ModelProviderInfo {
+            env_key: Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string()),
+            ..codex_core::ModelProviderInfo::create_github_copilot_provider()
+        };
+        app.config.model_provider_id = provider_id.clone();
+        app.config.model_provider = provider.clone();
+        app.config
+            .model_providers
+            .insert(provider_id.clone(), provider.clone());
+
+        let gpt_model =
+            codex_core::test_support::construct_model_info_offline("gpt-5.3-codex", &app.config);
+        let claude_model =
+            codex_core::test_support::construct_model_info_offline("claude-opus-4.6", &app.config);
+        app.config.model_catalog = Some(ModelsResponse {
+            models: vec![gpt_model, claude_model],
+        });
+
+        let presets = app.provider_model_presets_for_picker().await;
+        let custom_provider_models = presets
+            .iter()
+            .filter(|preset| preset.provider_id == provider_id)
+            .map(|preset| preset.model.model.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            custom_provider_models,
+            vec!["gpt-5.3-codex".to_string(), "claude-opus-4.6".to_string()]
         );
         Ok(())
     }
