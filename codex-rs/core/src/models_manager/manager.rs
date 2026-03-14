@@ -338,7 +338,7 @@ impl ModelsManager {
             RefreshStrategy::OnlineIfUncached => {
                 if self.provider.is_github_copilot_provider() {
                     info!("models cache: bypassing cache for github-copilot provider");
-                    return self.fetch_and_update_models().await;
+                    return self.fetch_and_update_models_with_guard().await;
                 }
                 // Try cache first, fall back to online if unavailable
                 if self.try_load_cache().await {
@@ -346,11 +346,27 @@ impl ModelsManager {
                     return Ok(());
                 }
                 info!("models cache: cache miss, fetching remote models");
-                self.fetch_and_update_models().await
+                self.fetch_and_update_models_with_guard().await
             }
             RefreshStrategy::Online => {
                 // Always fetch from network
-                self.fetch_and_update_models().await
+                self.fetch_and_update_models_with_guard().await
+            }
+        }
+    }
+
+    async fn fetch_and_update_models_with_guard(&self) -> CoreResult<()> {
+        match self.fetch_and_update_models().await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if self.provider.is_local_oss_provider() {
+                    warn!(
+                        error = %err,
+                        "local OSS models refresh failed; clearing catalog to avoid bundled fallback models"
+                    );
+                    self.apply_remote_models(Vec::new()).await;
+                }
+                Err(err)
             }
         }
     }
@@ -1992,6 +2008,47 @@ mod tests {
                 .iter()
                 .any(|preset| preset.model == "qwen2.5-coder:7b"),
             "local OSS provider should refresh from /v1/models when cache scope mismatches"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_oss_provider_does_not_fall_back_to_bundled_models_when_fetch_fails() {
+        let server = MockServer::start().await;
+        let _v1_models = wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _api_tags = wiremock::Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let oss_auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+        let oss_provider = crate::model_provider_info::create_oss_provider_with_base_url(
+            &format!("{}/v1", server.uri()),
+            WireApi::Responses,
+        );
+        let oss_manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            oss_auth,
+            oss_provider,
+        );
+
+        let available = oss_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await;
+        assert!(
+            available.is_empty(),
+            "local OSS providers must not expose bundled fallback models when discovery fails; got: {:?}",
+            available
+                .iter()
+                .map(|preset| &preset.model)
+                .collect::<Vec<_>>()
         );
     }
 }

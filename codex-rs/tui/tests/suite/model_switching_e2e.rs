@@ -170,6 +170,48 @@ async fn ollama_model_picker_uses_local_models_endpoint_and_switches() -> Result
 }
 
 #[tokio::test]
+async fn ollama_model_picker_does_not_switch_to_bundled_gpt_when_discovery_fails() -> Result<()> {
+    // run_codex_cli_with_filter() does not work on Windows due to PTY limitations.
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
+    let codex_home = tempdir_with_ollama_config(&repo_root, "llama3.2:latest")?;
+    let (base_url, server) = spawn_failing_ollama_discovery_server()?;
+
+    let mut env = HashMap::new();
+    env.insert("CODEX_OSS_BASE_URL".to_string(), base_url);
+
+    let output = run_codex_cli_with_filter(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        "llama3.2:latest",
+        "gpt-5",
+        None,
+        env,
+    )
+    .await
+    .context("attempt to switch Ollama to bundled GPT slug when model discovery fails")?;
+    assert_model_and_provider_in_config(codex_home.path(), "llama3.2:latest", "ollama", &output)?;
+
+    let requests = server.join().expect("discovery server should join")?;
+    assert!(
+        requests
+            .iter()
+            .any(|line| line.starts_with("GET /v1/models ")),
+        "expected GET /v1/models request, got: {requests:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn ollama_model_switch_then_prompt_uses_responses_api() -> Result<()> {
     // run_codex_cli_with_filter() does not work on Windows due to PTY limitations.
     if cfg!(windows) {
@@ -599,6 +641,82 @@ fn spawn_models_server(
     Ok((format!("http://{address}/v1"), handle))
 }
 
+fn spawn_failing_ollama_discovery_server()
+-> Result<(String, thread::JoinHandle<Result<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .context("failed to set nonblocking listener")?;
+        let mut requests = Vec::new();
+        let hard_deadline = Instant::now() + Duration::from_secs(20);
+        let mut idle_deadline: Option<Instant> = None;
+        while Instant::now() < hard_deadline
+            && idle_deadline
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(true)
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .context("failed to set read timeout")?;
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                request.extend_from_slice(&chunk[..bytes_read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request).to_string();
+                    let request_line = request.lines().next().unwrap_or_default().to_string();
+                    requests.push(request_line.clone());
+
+                    let response = if request_line.starts_with("GET /v1/models ")
+                        || request_line.starts_with("GET /api/tags ")
+                    {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 24\r\n\r\n{\"error\":\"test failure\"}"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    stream
+                        .write_all(response.as_bytes())
+                        .context("failed to write discovery failure response")?;
+                    stream
+                        .flush()
+                        .context("failed to flush discovery failure response")?;
+
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(2));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(requests)
+    });
+
+    Ok((format!("http://{address}/v1"), handle))
+}
+
 fn model_from_template(
     template: &JsonValue,
     slug: &str,
@@ -770,6 +888,11 @@ async fn run_codex_cli_with_filter(
     }
 
     let output = String::from_utf8_lossy(&output).to_string();
+    if std::env::var("CODEX_E2E_DUMP_OUTPUT").ok().as_deref() == Some("1") {
+        eprintln!(
+            "--- BEGIN model_switching_e2e PTY OUTPUT ---\n{output}\n--- END model_switching_e2e PTY OUTPUT ---"
+        );
+    }
     anyhow::ensure!(
         exit_code == 0 || exit_code == 130,
         "unexpected exit code from codex: {exit_code}; output: {output}"
