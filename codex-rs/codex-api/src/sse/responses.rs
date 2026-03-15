@@ -194,6 +194,12 @@ pub async fn process_sse(
         let raw = sse.data.clone();
         trace!("SSE event: {raw}");
 
+        // Log raw SSE data at debug level for function-call related events so
+        // we can diagnose provider compatibility without enabling trace.
+        if raw.contains("function_call") || raw.contains("output_item") {
+            debug!("SSE raw ({} bytes): {raw}", raw.len());
+        }
+
         let event: SseEvent = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
             Err(e) => {
@@ -853,13 +859,13 @@ mod tests {
                 "type": "response.function_call_arguments.delta",
                 "item_id": "fc_1",
                 "output_index": 0,
-                "delta": "{\"comma"
+                "delta": "{\"co"
             }),
             json!({
                 "type": "response.function_call_arguments.delta",
                 "item_id": "fc_1",
                 "output_index": 0,
-                "delta": "nd\": \"ls\"}"
+                "delta": "mmand\": \"ls\"}"
             }),
             json!({
                 "type": "response.function_call_arguments.done",

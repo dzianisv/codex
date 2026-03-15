@@ -265,7 +265,11 @@ impl ModelProviderInfo {
             env_key: Some(GITHUB_COPILOT_TOKEN_ENV_KEY.into()),
             env_key_instructions: Some(GITHUB_COPILOT_TOKEN_INSTRUCTIONS.into()),
             experimental_bearer_token: None,
-            wire_api: WireApi::Responses,
+            // The Copilot gateway does not support the Responses API for all
+            // models (e.g. Claude returns "unsupported_api_for_model"). The
+            // Chat Completions API works universally and has mature tool_calls
+            // handling.
+            wire_api: WireApi::Chat,
             query_params: None,
             http_headers: Some(
                 [(
@@ -551,7 +555,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             Some(GITHUB_COPILOT_TOKEN_INSTRUCTIONS)
         );
         assert_eq!(copilot.requires_openai_auth, false);
-        assert_eq!(copilot.wire_api, WireApi::Responses);
+        assert_eq!(copilot.wire_api, WireApi::Chat);
         assert_eq!(
             copilot
                 .http_headers
