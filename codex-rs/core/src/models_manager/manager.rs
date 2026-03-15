@@ -438,12 +438,20 @@ impl ModelsManager {
                 Ok(api_auth) => api_auth,
                 Err(CodexErr::EnvVar(_)) => {
                     info!("models refresh skipped: github-copilot token is unavailable");
+                    // Avoid showing bundled fallback models when the provider
+                    // cannot be authenticated.
+                    self.apply_remote_models(Vec::new()).await;
+                    *self.etag.write().await = None;
                     return Ok(());
                 }
                 Err(err) => return Err(err),
             };
             let Some(token) = api_auth.bearer_token() else {
                 info!("models refresh skipped: github-copilot auth token is unavailable");
+                // Avoid showing bundled fallback models when the provider
+                // cannot be authenticated.
+                self.apply_remote_models(Vec::new()).await;
+                *self.etag.write().await = None;
                 return Ok(());
             };
 
@@ -1631,6 +1639,40 @@ mod tests {
                 .iter()
                 .any(|preset| preset.model == "claude-3.7-sonnet"),
             "expected claude-3.7-sonnet to be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_available_models_clears_copilot_catalog_when_token_is_unavailable() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.env_key = Some("__CODEX_TEST_COPILOT_ENV_KEY_MISSING__".to_string());
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("refresh should complete even without token");
+
+        let available = manager
+            .try_list_models()
+            .expect("models should be available");
+        assert!(
+            available.is_empty(),
+            "expected no github-copilot models without token, got: {:?}",
+            available
+                .iter()
+                .map(|preset| preset.model.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
