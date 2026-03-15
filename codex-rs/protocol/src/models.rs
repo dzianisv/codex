@@ -62,6 +62,19 @@ pub enum ContentItem {
     OutputText { text: String },
 }
 
+/// Deserializes `arguments` accepting either a JSON string or a JSON object.
+/// When the value is an object, it is serialized back to a string.
+fn deserialize_arguments<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => Ok(s),
+        other => Ok(other.to_string()),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
@@ -101,7 +114,13 @@ pub enum ResponseItem {
         // JSON, not as an already‑parsed object. We keep it as a raw string here and let
         // Session::handle_function_call parse it into a Value. This exactly matches the
         // Chat Completions + Responses API behavior.
+        //
+        // Some providers (e.g. GitHub Copilot proxying Claude) may return `arguments` as
+        // an already-parsed JSON object instead of a string. The custom deserializer
+        // handles both forms.
+        #[serde(deserialize_with = "deserialize_arguments")]
         arguments: String,
+        #[serde(default)]
         call_id: String,
     },
     // NOTE: The input schema for `function_call_output` objects that clients send to the
@@ -557,6 +576,68 @@ mod tests {
     use mcp_types::TextContent;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    #[test]
+    fn function_call_arguments_as_string() -> Result<()> {
+        let json = serde_json::json!({
+            "type": "function_call",
+            "name": "shell",
+            "arguments": "{\"command\": \"ls\"}",
+            "call_id": "call_1"
+        });
+        let item: ResponseItem = serde_json::from_value(json)?;
+        assert_eq!(
+            item,
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".into(),
+                arguments: "{\"command\": \"ls\"}".into(),
+                call_id: "call_1".into(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn function_call_arguments_as_object() -> Result<()> {
+        let json = serde_json::json!({
+            "type": "function_call",
+            "name": "shell",
+            "arguments": {"command": "ls"},
+            "call_id": "call_1"
+        });
+        let item: ResponseItem = serde_json::from_value(json)?;
+        assert_eq!(
+            item,
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+                call_id: "call_1".into(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn function_call_missing_call_id() -> Result<()> {
+        let json = serde_json::json!({
+            "type": "function_call",
+            "name": "shell",
+            "arguments": "{\"command\": \"ls\"}"
+        });
+        let item: ResponseItem = serde_json::from_value(json)?;
+        assert_eq!(
+            item,
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".into(),
+                arguments: "{\"command\": \"ls\"}".into(),
+                call_id: String::new(),
+            }
+        );
+        Ok(())
+    }
 
     #[test]
     fn serializes_success_as_plain_string() -> Result<()> {

@@ -13,6 +13,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
@@ -118,6 +119,7 @@ struct ResponseCompletedOutputTokensDetails {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct SseEvent {
     #[serde(rename = "type")]
     kind: String,
@@ -126,6 +128,13 @@ struct SseEvent {
     delta: Option<String>,
     summary_index: Option<i64>,
     content_index: Option<i64>,
+    /// Identifies the output item for `function_call_arguments` events.
+    item_id: Option<String>,
+    output_index: Option<i64>,
+    /// Complete arguments string sent with `function_call_arguments.done`.
+    arguments: Option<String>,
+    /// Function name sent with `function_call_arguments.done`.
+    name: Option<String>,
 }
 
 pub async fn process_sse(
@@ -137,6 +146,11 @@ pub async fn process_sse(
     let mut stream = stream.eventsource();
     let mut response_completed: Option<ResponseCompleted> = None;
     let mut response_error: Option<ApiError> = None;
+    // Track in-flight function call arguments keyed by item_id.
+    let mut fc_args: HashMap<String, String> = HashMap::new();
+    // Track function call metadata (name, call_id) from output_item.added.
+    let mut fc_meta: HashMap<String, (String, String)> = HashMap::new();
+    let mut next_fc_id: u64 = 0;
 
     loop {
         let start = Instant::now();
@@ -191,10 +205,52 @@ pub async fn process_sse(
         match event.kind.as_str() {
             "response.output_item.done" => {
                 let Some(item_val) = event.item else { continue };
-                let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) else {
-                    debug!("failed to parse ResponseItem from output_item.done");
+                let item_id = item_val
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                let Ok(mut item) = serde_json::from_value::<ResponseItem>(item_val.clone()) else {
+                    debug!(
+                        "failed to parse ResponseItem from output_item.done: {}",
+                        item_val
+                    );
                     continue;
                 };
+
+                // For function calls, fill in any missing data.
+                if let ResponseItem::FunctionCall {
+                    ref mut arguments,
+                    ref mut call_id,
+                    ..
+                } = item
+                {
+                    // Use accumulated arguments from delta/done events if the
+                    // deserialized arguments are empty.
+                    if arguments.is_empty() {
+                        if let Some(id) = &item_id
+                            && let Some(accumulated) = fc_args.remove(id)
+                        {
+                            *arguments = accumulated;
+                        }
+                    } else if let Some(id) = &item_id {
+                        fc_args.remove(id);
+                    }
+
+                    // Generate a synthetic call_id when the provider omits one.
+                    if call_id.is_empty() {
+                        if let Some(id) = &item_id
+                            && let Some((_, stored_call_id)) = fc_meta.remove(id)
+                            && !stored_call_id.is_empty()
+                        {
+                            *call_id = stored_call_id;
+                        }
+                        if call_id.is_empty() {
+                            *call_id = format!("fc-{next_fc_id}");
+                            next_fc_id += 1;
+                        }
+                    }
+                }
 
                 let event = ResponseEvent::OutputItemDone(item);
                 if tx_event.send(Ok(event)).await.is_err() {
@@ -275,14 +331,47 @@ pub async fn process_sse(
             }
             "response.output_item.added" => {
                 let Some(item_val) = event.item else { continue };
+                // Stash function call metadata for later use in output_item.done.
+                if item_val.get("type").and_then(|v| v.as_str()) == Some("function_call")
+                    && let Some(id) = item_val.get("id").and_then(|v| v.as_str())
+                {
+                    let name = item_val
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let call_id = item_val
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    fc_meta.insert(id.to_string(), (name, call_id));
+                }
+
                 let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) else {
-                    debug!("failed to parse ResponseItem from output_item.done");
+                    debug!("failed to parse ResponseItem from output_item.added");
                     continue;
                 };
 
                 let event = ResponseEvent::OutputItemAdded(item);
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let Some(item_id) = event.item_id
+                    && let Some(delta) = event.delta
+                {
+                    fc_args.entry(item_id).or_default().push_str(&delta);
+                }
+            }
+            "response.function_call_arguments.done" => {
+                if let Some(item_id) = event.item_id
+                    && let Some(arguments) = event.arguments
+                {
+                    // The .done event carries the complete arguments; replace
+                    // any partial accumulation from delta events.
+                    fc_args.insert(item_id, arguments);
                 }
             }
             "response.reasoning_summary_part.added" => {
@@ -668,5 +757,200 @@ mod tests {
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs(35)));
+    }
+
+    #[tokio::test]
+    async fn function_call_with_object_arguments() {
+        // Some providers (e.g. Copilot proxying Claude) return `arguments` as
+        // a JSON object instead of a JSON string.
+        let events = run_sse(vec![
+            json!({"type": "response.created", "response": {"id": "r1"}}),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "shell",
+                    "arguments": {"command": "ls -la"},
+                    "call_id": "call_1"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "r1"}
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 3);
+        assert_matches!(
+            &events[1],
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(arguments, r#"{"command":"ls -la"}"#);
+                assert_eq!(call_id, "call_1");
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn function_call_missing_call_id() {
+        // When a provider omits `call_id`, we generate a synthetic one.
+        let events = run_sse(vec![
+            json!({"type": "response.created", "response": {"id": "r1"}}),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "shell",
+                    "arguments": "{\"command\": \"ls\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "r1"}
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 3);
+        assert_matches!(
+            &events[1],
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(call_id, "fc-0");
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn function_call_arguments_streaming() {
+        // Simulate the Responses API streaming function call arguments
+        // via delta/done events followed by output_item.done.
+        let events = run_sse(vec![
+            json!({"type": "response.created", "response": {"id": "r1"}}),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "shell",
+                    "arguments": "",
+                    "call_id": "call_1"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "delta": "{\"comma"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "delta": "nd\": \"ls\"}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "arguments": "{\"command\": \"ls\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "shell",
+                    "arguments": "{\"command\": \"ls\"}",
+                    "call_id": "call_1"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "r1"}
+            }),
+        ])
+        .await;
+
+        // output_item.added + output_item.done + completed
+        assert_eq!(events.len(), 4);
+        assert_matches!(
+            &events[2],
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(arguments, "{\"command\": \"ls\"}");
+                assert_eq!(call_id, "call_1");
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn function_call_arguments_from_done_event_only() {
+        // When output_item.done arrives with empty arguments but
+        // function_call_arguments.done provided them, we use those.
+        let events = run_sse(vec![
+            json!({"type": "response.created", "response": {"id": "r1"}}),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "shell",
+                    "arguments": "",
+                    "call_id": "call_1"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "arguments": "{\"command\": \"pwd\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "name": "shell",
+                    "arguments": "",
+                    "call_id": "call_1"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "r1"}
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 4);
+        assert_matches!(
+            &events[2],
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(arguments, "{\"command\": \"pwd\"}");
+            }
+        );
     }
 }
