@@ -376,32 +376,34 @@ async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provide
     };
     let prompt = "When the first gpt model was released?";
     let answer_text = "The first GPT model (GPT-1) was released in June 2018.";
+    let startup_model = "gpt-5";
+    let selected_model = "claude-4.6-opus";
     let (base_url, server) = spawn_openai_compat_models_and_responses_server(
         serde_json::json!({
             "object": "list",
             "data": [
                 {
-                    "id": "copilot-test-a",
+                    "id": startup_model,
                     "object": "model",
                     "model_picker_enabled": true,
                     "supported_endpoints": ["/responses"]
                 },
                 {
-                    "id": "copilot-test-b",
+                    "id": selected_model,
                     "object": "model",
                     "model_picker_enabled": true,
                     "supported_endpoints": ["/responses"]
                 }
             ]
         }),
-        "copilot-test-b",
+        selected_model,
         answer_text,
     )?;
     let codex_home = tempdir_with_github_copilot_config(
         &repo_root,
-        "copilot-test-a",
+        startup_model,
         base_url.as_str(),
-        &["copilot-test-a", "copilot-test-b"],
+        &[startup_model, selected_model],
     )?;
 
     let mut env = HashMap::new();
@@ -413,8 +415,8 @@ async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provide
         &codex_cli,
         codex_home.path(),
         &repo_root,
-        "copilot-test-a",
-        "copilot-test-b",
+        startup_model,
+        selected_model,
         Some(prompt),
         env,
     )
@@ -422,18 +424,24 @@ async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provide
     .context("switch model via /model and run prompt against local Copilot responses API")?;
     assert_model_and_provider_in_config(
         codex_home.path(),
-        "copilot-test-b",
+        selected_model,
         "github-copilot",
         &output,
     )?;
 
     let requests = server.join().expect("model/responses server should join")?;
+    anyhow::ensure!(
+        requests
+            .iter()
+            .any(|request| is_models_endpoint_request(request)),
+        "expected GET /v1/models request against localhost Copilot provider; got requests: {requests:?}"
+    );
     let responses_request = requests
         .iter()
         .find(|request| request.starts_with("POST /v1/responses "))
         .context("missing POST /v1/responses request")?;
     anyhow::ensure!(
-        responses_request.contains("\"model\":\"copilot-test-b\""),
+        responses_request.contains(format!("\"model\":\"{selected_model}\"").as_str()),
         "expected switched model in /responses request body; request: {responses_request}"
     );
     anyhow::ensure!(
@@ -459,13 +467,14 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
 
     let prompt = "When the first gpt model was released?";
     let answer_text = "The first GPT model (GPT-1) was released in June 2018.";
+    let startup_model = "gpt-5";
     let selected_model = "claude-4.6-opus";
     let (base_url, server) = spawn_openai_compat_models_with_chat_completions_fallback_server(
         serde_json::json!({
             "object": "list",
             "data": [
                 {
-                    "id": "copilot-test-a",
+                    "id": startup_model,
                     "object": "model",
                     "model_picker_enabled": true,
                     "supported_endpoints": ["/responses"]
@@ -483,9 +492,9 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
     )?;
     let codex_home = tempdir_with_github_copilot_config(
         &repo_root,
-        "copilot-test-a",
+        startup_model,
         base_url.as_str(),
-        &["copilot-test-a", selected_model],
+        &[startup_model, selected_model],
     )?;
 
     let mut env = HashMap::new();
@@ -497,7 +506,7 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
         &codex_cli,
         codex_home.path(),
         &repo_root,
-        "copilot-test-a",
+        startup_model,
         selected_model,
         Some(prompt),
         env,
@@ -516,6 +525,12 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
     );
 
     let requests = server.join().expect("model/responses server should join")?;
+    anyhow::ensure!(
+        requests
+            .iter()
+            .any(|request| is_models_endpoint_request(request)),
+        "expected GET /v1/models request against localhost Copilot provider; got requests: {requests:?}"
+    );
     let responses_request = requests
         .iter()
         .find(|request| request.starts_with("POST /v1/responses "))
