@@ -32,7 +32,36 @@ async fn model_picker_search_switches_and_persists_across_restarts() -> Result<(
         eprintln!("skipping integration test because codex binary is unavailable");
         return Ok(());
     };
-    let codex_home = tempdir_with_catalog_and_config(&repo_root)?;
+    let codex_home = tempdir_with_ollama_config(&repo_root, "gpt-5.3-codex")?;
+    let (first_base_url, first_server) = spawn_models_server(serde_json::json!({
+        "object": "list",
+        "data": [
+            {"id": "gpt-5.3-codex", "object": "model"},
+            {"id": "claude-opus-4.6", "object": "model"}
+        ]
+    }))?;
+    let (first_models_dev_url, first_models_dev_server) =
+        spawn_models_dev_catalog_server(serde_json::json!({
+            "github-copilot": {
+                "id": "github-copilot",
+                "name": "GitHub Copilot",
+                "api": "https://api.githubcopilot.com/v1",
+                "models": {
+                    "gpt-5.3-codex": {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex"}
+                }
+            },
+            "lmstudio": {
+                "id": "lmstudio",
+                "name": "LM Studio",
+                "api": "http://127.0.0.1:1234/v1",
+                "models": {
+                    "qwen2.5-coder:7b": {"id": "qwen2.5-coder:7b", "name": "qwen2.5-coder:7b"}
+                }
+            }
+        }))?;
+    let mut first_env = HashMap::new();
+    first_env.insert("CODEX_OSS_BASE_URL".to_string(), first_base_url);
+    first_env.insert("CODEX_MODELS_DEV_URL".to_string(), first_models_dev_url);
 
     let first_output = run_codex_cli_with_filter(
         &codex_cli,
@@ -41,16 +70,58 @@ async fn model_picker_search_switches_and_persists_across_restarts() -> Result<(
         "gpt-5.3-codex",
         "claude",
         None,
-        HashMap::new(),
+        first_env,
     )
     .await
     .context("switch from gpt-5.3-codex to claude-opus-4.6")?;
     assert_model_and_provider_in_config(
         codex_home.path(),
         "claude-opus-4.6",
-        "github-copilot",
+        "ollama",
         &first_output,
     )?;
+    let first_requests = first_server
+        .join()
+        .expect("first model server should join")?;
+    anyhow::ensure!(
+        first_requests
+            .iter()
+            .any(|line| is_models_endpoint_request(line)),
+        "expected GET /v1/models in first run, got: {first_requests:?}"
+    );
+    let _first_models_dev_requests = first_models_dev_server
+        .join()
+        .expect("first models.dev server should join")?;
+
+    let (second_base_url, second_server) = spawn_models_server(serde_json::json!({
+        "object": "list",
+        "data": [
+            {"id": "gpt-5.3-codex", "object": "model"},
+            {"id": "claude-opus-4.6", "object": "model"}
+        ]
+    }))?;
+    let (second_models_dev_url, second_models_dev_server) =
+        spawn_models_dev_catalog_server(serde_json::json!({
+            "github-copilot": {
+                "id": "github-copilot",
+                "name": "GitHub Copilot",
+                "api": "https://api.githubcopilot.com/v1",
+                "models": {
+                    "gpt-5.3-codex": {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex"}
+                }
+            },
+            "lmstudio": {
+                "id": "lmstudio",
+                "name": "LM Studio",
+                "api": "http://127.0.0.1:1234/v1",
+                "models": {
+                    "qwen2.5-coder:7b": {"id": "qwen2.5-coder:7b", "name": "qwen2.5-coder:7b"}
+                }
+            }
+        }))?;
+    let mut second_env = HashMap::new();
+    second_env.insert("CODEX_OSS_BASE_URL".to_string(), second_base_url);
+    second_env.insert("CODEX_MODELS_DEV_URL".to_string(), second_models_dev_url);
 
     let second_output = run_codex_cli_with_filter(
         &codex_cli,
@@ -59,16 +130,28 @@ async fn model_picker_search_switches_and_persists_across_restarts() -> Result<(
         "claude-opus-4.6",
         "gpt-5.3-codex",
         None,
-        HashMap::new(),
+        second_env,
     )
     .await
     .context("switch back from claude-opus-4.6 to gpt-5.3-codex")?;
     assert_model_and_provider_in_config(
         codex_home.path(),
         "gpt-5.3-codex",
-        "github-copilot",
+        "ollama",
         &second_output,
     )?;
+    let second_requests = second_server
+        .join()
+        .expect("second model server should join")?;
+    anyhow::ensure!(
+        second_requests
+            .iter()
+            .any(|line| is_models_endpoint_request(line)),
+        "expected GET /v1/models in second run, got: {second_requests:?}"
+    );
+    let _second_models_dev_requests = second_models_dev_server
+        .join()
+        .expect("second models.dev server should join")?;
 
     Ok(())
 }
@@ -115,9 +198,7 @@ async fn model_picker_ignores_openai_compat_models_disabled_for_picker() -> Resu
 
     let requests = server.join().expect("model listing server should join")?;
     assert!(
-        requests
-            .iter()
-            .any(|line| line.starts_with("GET /v1/models ")),
+        requests.iter().any(|line| is_models_endpoint_request(line)),
         "expected at least one GET /v1/models request, got: {requests:?}"
     );
 
@@ -163,9 +244,7 @@ async fn ollama_model_picker_uses_local_models_endpoint_and_switches() -> Result
 
     let requests = server.join().expect("model listing server should join")?;
     assert!(
-        requests
-            .iter()
-            .any(|line| line.starts_with("GET /v1/models ")),
+        requests.iter().any(|line| is_models_endpoint_request(line)),
         "expected at least one GET /v1/models request, got: {requests:?}"
     );
 
@@ -195,7 +274,7 @@ async fn ollama_model_picker_does_not_switch_to_bundled_gpt_when_discovery_fails
         codex_home.path(),
         &repo_root,
         "llama3.2:latest",
-        "gpt-5",
+        "github-copilot/gpt-5",
         None,
         env,
     )
@@ -205,9 +284,7 @@ async fn ollama_model_picker_does_not_switch_to_bundled_gpt_when_discovery_fails
 
     let requests = server.join().expect("discovery server should join")?;
     assert!(
-        requests
-            .iter()
-            .any(|line| line.starts_with("GET /v1/models ")),
+        requests.iter().any(|line| is_models_endpoint_request(line)),
         "expected GET /v1/models request, got: {requests:?}"
     );
 
@@ -265,7 +342,7 @@ async fn ollama_model_switch_then_prompt_uses_responses_api() -> Result<()> {
     anyhow::ensure!(
         requests
             .iter()
-            .any(|request| request.starts_with("GET /v1/models ")),
+            .any(|request| is_models_endpoint_request(request)),
         "expected GET /v1/models request; got requests: {requests:?}"
     );
     let responses_request = requests
@@ -320,7 +397,7 @@ async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provide
         "copilot-test-b",
         answer_text,
     )?;
-    let codex_home = tempdir_with_local_copilot_config(
+    let codex_home = tempdir_with_github_copilot_config(
         &repo_root,
         "copilot-test-a",
         base_url.as_str(),
@@ -329,7 +406,7 @@ async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provide
 
     let mut env = HashMap::new();
     env.insert(
-        "COPILOT_TEST_KEY".to_string(),
+        "GITHUB_COPILOT_TOKEN".to_string(),
         "test-copilot-token".to_string(),
     );
     let output = run_codex_cli_with_filter(
@@ -346,7 +423,7 @@ async fn copilot_model_switch_then_prompt_uses_responses_api_without_cli_provide
     assert_model_and_provider_in_config(
         codex_home.path(),
         "copilot-test-b",
-        "copilot-local",
+        "github-copilot",
         &output,
     )?;
 
@@ -382,7 +459,7 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
 
     let prompt = "When the first gpt model was released?";
     let answer_text = "The first GPT model (GPT-1) was released in June 2018.";
-    let selected_model = "claude-opus-4.6";
+    let selected_model = "claude-4.6-opus";
     let (base_url, server) = spawn_openai_compat_models_with_chat_completions_fallback_server(
         serde_json::json!({
             "object": "list",
@@ -404,7 +481,7 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
         selected_model,
         answer_text,
     )?;
-    let codex_home = tempdir_with_local_copilot_config(
+    let codex_home = tempdir_with_github_copilot_config(
         &repo_root,
         "copilot-test-a",
         base_url.as_str(),
@@ -413,7 +490,7 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
 
     let mut env = HashMap::new();
     env.insert(
-        "COPILOT_TEST_KEY".to_string(),
+        "GITHUB_COPILOT_TOKEN".to_string(),
         "test-copilot-token".to_string(),
     );
     let output = run_codex_cli_with_filter(
@@ -430,7 +507,7 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
     assert_model_and_provider_in_config(
         codex_home.path(),
         selected_model,
-        "copilot-local",
+        "github-copilot",
         &output,
     )?;
     anyhow::ensure!(
@@ -444,7 +521,7 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
         .find(|request| request.starts_with("POST /v1/responses "))
         .context("missing POST /v1/responses request")?;
     anyhow::ensure!(
-        responses_request.contains("\"model\":\"claude-opus-4.6\""),
+        responses_request.contains(format!("\"model\":\"{selected_model}\"").as_str()),
         "expected switched model in /responses request body; request: {responses_request}"
     );
 
@@ -453,7 +530,7 @@ async fn copilot_chat_completions_only_model_switch_then_prompt_preserves_model(
         .find(|request| request.starts_with("POST /v1/chat/completions "))
         .context("missing POST /v1/chat/completions request")?;
     anyhow::ensure!(
-        chat_request.contains("\"model\":\"claude-opus-4.6\""),
+        chat_request.contains(format!("\"model\":\"{selected_model}\"").as_str()),
         "expected switched model in /chat/completions request body; request: {chat_request}"
     );
     anyhow::ensure!(
@@ -581,42 +658,167 @@ async fn models_dev_provider_config_parses_custom_provider() -> Result<()> {
     Ok(())
 }
 
-fn tempdir_with_catalog_and_config(repo_root: &Path) -> Result<TempDir> {
-    let codex_home = tempfile::tempdir()?;
+#[tokio::test]
+async fn cross_provider_model_switch_applies_immediately_without_manual_new_session() -> Result<()>
+{
+    // run_codex_cli_with_filter() does not work on Windows due to PTY limitations.
+    if cfg!(windows) {
+        return Ok(());
+    }
 
-    let source_catalog_path = codex_utils_cargo_bin::find_resource!("../core/models.json")?;
-    let source_catalog = std::fs::read_to_string(&source_catalog_path)?;
-    let mut source_catalog: JsonValue = serde_json::from_str(&source_catalog)?;
-    let models = source_catalog
-        .get_mut("models")
-        .and_then(JsonValue::as_array_mut)
-        .context("models array missing")?;
-    let template = models.first().cloned().context("models array is empty")?;
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
 
-    let gpt_model = model_from_template(&template, "gpt-5.3-codex", "gpt-5.3-codex", 0)?;
-    let claude_model = model_from_template(&template, "claude-opus-4.6", "claude-opus-4.6", 1)?;
-    *models = vec![gpt_model, claude_model];
+    let startup_model = "azure-model-a";
+    let selected_model = "claude-4.6-opus";
+    let prompt = "Name the provider handling this prompt.";
+    let azure_answer = "Azure should not handle the post-switch prompt.";
+    let copilot_answer = "Copilot provider handled this prompt immediately.";
 
-    let custom_catalog_path = codex_home.path().join("catalog.json");
-    std::fs::write(
-        &custom_catalog_path,
-        serde_json::to_string(&source_catalog)?,
+    let (azure_base_url, azure_server) = spawn_openai_compat_models_and_responses_server(
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": startup_model, "object": "model"},
+                {"id": "azure-model-b", "object": "model"}
+            ]
+        }),
+        startup_model,
+        azure_answer,
+    )?;
+    let (copilot_base_url, copilot_server) = spawn_openai_compat_models_and_responses_server(
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": selected_model, "object": "model"}
+            ]
+        }),
+        selected_model,
+        copilot_answer,
+    )?;
+    let (models_dev_url, models_dev_server) = spawn_models_dev_catalog_server(serde_json::json!({
+        "azure": {
+            "id": "azure",
+            "name": "Azure",
+            "api": azure_base_url.clone(),
+            "models": {
+                startup_model: {"id": startup_model, "name": startup_model},
+                "azure-model-b": {"id": "azure-model-b", "name": "azure-model-b"}
+            }
+        },
+        "github-copilot": {
+            "id": "github-copilot",
+            "name": "GitHub Copilot",
+            "api": copilot_base_url.clone(),
+            "models": {
+                selected_model: {"id": selected_model, "name": selected_model}
+            }
+        },
+        "ollama": {
+            "id": "ollama",
+            "name": "Ollama",
+            "api": "http://127.0.0.1:11434/v1",
+            "models": {
+                "llama3.2:latest": {"id": "llama3.2:latest", "name": "llama3.2:latest"}
+            }
+        },
+        "lmstudio": {
+            "id": "lmstudio",
+            "name": "LM Studio",
+            "api": "http://127.0.0.1:1234/v1",
+            "models": {
+                "qwen2.5-coder:7b": {"id": "qwen2.5-coder:7b", "name": "qwen2.5-coder:7b"}
+            }
+        }
+    }))?;
+    let codex_home = tempdir_with_dual_provider_config(
+        &repo_root,
+        startup_model,
+        azure_base_url.as_str(),
+        copilot_base_url.as_str(),
     )?;
 
-    let repo_root_display = repo_root.display();
-    let catalog_display = custom_catalog_path.display();
-    let config_contents = format!(
-        r#"model_provider = "github-copilot"
-model = "gpt-5.3-codex"
-model_catalog_json = "{catalog_display}"
-
-[projects."{repo_root_display}"]
-trust_level = "trusted"
-"#
+    let mut env = HashMap::new();
+    env.insert("AZURE_TEST_KEY".to_string(), "test-azure-token".to_string());
+    env.insert(
+        "GITHUB_COPILOT_TOKEN".to_string(),
+        "test-copilot-token".to_string(),
     );
-    std::fs::write(codex_home.path().join("config.toml"), config_contents)?;
+    env.insert("CODEX_MODELS_DEV_URL".to_string(), models_dev_url);
 
-    Ok(codex_home)
+    let output = run_codex_cli_with_filter(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        startup_model,
+        selected_model,
+        Some(prompt),
+        env,
+    )
+    .await
+    .context("cross-provider switch via /model should apply immediately in-session")?;
+
+    let azure_requests = azure_server
+        .join()
+        .expect("azure test server should join")?;
+    let copilot_requests = copilot_server
+        .join()
+        .expect("copilot test server should join")?;
+    let models_dev_requests = models_dev_server
+        .join()
+        .expect("models.dev server should join")?;
+
+    anyhow::ensure!(
+        copilot_requests
+            .iter()
+            .any(|request| is_models_endpoint_request(request)),
+        "expected Copilot provider /models discovery request; got requests: {copilot_requests:?}"
+    );
+    anyhow::ensure!(
+        models_dev_requests
+            .iter()
+            .any(|request| request.starts_with("GET /api.json ")),
+        "expected GET /api.json request; got requests: {models_dev_requests:?}"
+    );
+
+    assert_model_and_provider_in_config(
+        codex_home.path(),
+        selected_model,
+        "github-copilot",
+        &output,
+    )?;
+    anyhow::ensure!(
+        output.contains(copilot_answer),
+        "expected Copilot answer after in-session provider switch, got: {output}"
+    );
+    anyhow::ensure!(
+        !output.contains("Start a new session to apply provider change"),
+        "did not expect restart hint after provider switch, got: {output}"
+    );
+
+    let copilot_responses_request = copilot_requests
+        .iter()
+        .find(|request| request.starts_with("POST /v1/responses "))
+        .context("missing Copilot POST /v1/responses request after provider switch")?;
+    anyhow::ensure!(
+        copilot_responses_request.contains(format!("\"model\":\"{selected_model}\"").as_str()),
+        "expected selected model in Copilot /responses request body; request: {copilot_responses_request}"
+    );
+    anyhow::ensure!(
+        copilot_responses_request.contains(prompt),
+        "expected prompt text in Copilot /responses request body; request: {copilot_responses_request}"
+    );
+    anyhow::ensure!(
+        !azure_requests
+            .iter()
+            .any(|request| request.starts_with("POST /v1/responses ")),
+        "did not expect post-switch /responses requests against Azure provider; requests: {azure_requests:?}"
+    );
+
+    Ok(())
 }
 
 fn tempdir_with_ollama_config(repo_root: &Path, model: &str) -> Result<TempDir> {
@@ -626,6 +828,7 @@ fn tempdir_with_ollama_config(repo_root: &Path, model: &str) -> Result<TempDir> 
     let config_contents = format!(
         r#"model_provider = "ollama"
 model = "{model}"
+cli_auth_credentials_store = "file"
 
 [projects."{repo_root_display}"]
 trust_level = "trusted"
@@ -636,7 +839,7 @@ trust_level = "trusted"
     Ok(codex_home)
 }
 
-fn tempdir_with_local_copilot_config(
+fn tempdir_with_github_copilot_config(
     repo_root: &Path,
     model: &str,
     base_url: &str,
@@ -669,14 +872,15 @@ fn tempdir_with_local_copilot_config(
     let repo_root_display = repo_root.display();
     let catalog_display = custom_catalog_path.display();
     let config_contents = format!(
-        r#"model_provider = "copilot-local"
+        r#"model_provider = "github-copilot"
 model = "{model}"
 model_catalog_json = "{catalog_display}"
+cli_auth_credentials_store = "file"
 
-[model_providers.copilot-local]
+[model_providers.github-copilot]
 name = "GitHub Copilot"
 base_url = "{base_url}"
-env_key = "COPILOT_TEST_KEY"
+env_key = "GITHUB_COPILOT_TOKEN"
 wire_api = "responses"
 
 [projects."{repo_root_display}"]
@@ -702,6 +906,7 @@ fn tempdir_with_models_dev_provider_config(
     let config_contents = format!(
         r#"model_provider = "{provider_id}"
 model = "{model}"
+cli_auth_credentials_store = "file"
 
 [model_providers.{provider_id}]
 name = "{provider_name}"
@@ -716,6 +921,45 @@ trust_level = "trusted"
     std::fs::write(codex_home.path().join("config.toml"), config_contents)?;
 
     Ok(codex_home)
+}
+
+fn tempdir_with_dual_provider_config(
+    repo_root: &Path,
+    startup_model: &str,
+    azure_base_url: &str,
+    copilot_base_url: &str,
+) -> Result<TempDir> {
+    let codex_home = tempfile::tempdir()?;
+
+    let repo_root_display = repo_root.display();
+    let config_contents = format!(
+        r#"model_provider = "azure-local"
+model = "{startup_model}"
+cli_auth_credentials_store = "file"
+
+[model_providers.azure-local]
+name = "Azure"
+base_url = "{azure_base_url}"
+env_key = "AZURE_TEST_KEY"
+wire_api = "responses"
+
+[model_providers.github-copilot]
+name = "GitHub Copilot"
+base_url = "{copilot_base_url}"
+env_key = "GITHUB_COPILOT_TOKEN"
+wire_api = "responses"
+
+[projects."{repo_root_display}"]
+trust_level = "trusted"
+"#
+    );
+    std::fs::write(codex_home.path().join("config.toml"), config_contents)?;
+
+    Ok(codex_home)
+}
+
+fn is_models_endpoint_request(request_line: &str) -> bool {
+    request_line.starts_with("GET /v1/models ") || request_line.starts_with("GET /v1/models?")
 }
 
 fn spawn_models_server(
@@ -837,7 +1081,7 @@ fn spawn_failing_ollama_discovery_server()
                     let request_line = request.lines().next().unwrap_or_default().to_string();
                     requests.push(request_line.clone());
 
-                    let response = if request_line.starts_with("GET /v1/models ")
+                    let response = if is_models_endpoint_request(&request_line)
                         || request_line.starts_with("GET /api/tags ")
                     {
                         "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 24\r\n\r\n{\"error\":\"test failure\"}"
@@ -917,6 +1161,29 @@ async fn run_codex_cli_with_filter(
     prompt_after_switch: Option<&str>,
     extra_env: HashMap<String, String>,
 ) -> Result<String> {
+    run_codex_cli_with_filter_options(
+        codex_cli,
+        codex_home,
+        cwd,
+        startup_model_hint,
+        filter,
+        prompt_after_switch,
+        extra_env,
+        true,
+    )
+    .await
+}
+
+async fn run_codex_cli_with_filter_options(
+    codex_cli: &Path,
+    codex_home: &Path,
+    cwd: &Path,
+    startup_model_hint: &str,
+    filter: &str,
+    prompt_after_switch: Option<&str>,
+    extra_env: HashMap<String, String>,
+    send_escape_before_prompt: bool,
+) -> Result<String> {
     let mut env = HashMap::new();
     env.insert("CODEX_HOME".to_string(), codex_home.display().to_string());
     env.extend(extra_env);
@@ -951,6 +1218,8 @@ async fn run_codex_cli_with_filter(
     let writer_tx = session.writer_sender();
     let writer_for_input = writer_tx.clone();
     let (startup_ready_tx, mut startup_ready_rx) = watch::channel(false);
+    let (reasoning_prompt_tx, mut reasoning_prompt_rx) = watch::channel(false);
+    const REASONING_CONFIRM_HINT: &str = "Press enter to confirm or esc to go back";
     let filter = filter.to_string();
     let prompt_after_switch = prompt_after_switch.map(std::borrow::ToOwned::to_owned);
     let input_task = tokio::spawn(async move {
@@ -966,7 +1235,8 @@ async fn run_codex_cli_with_filter(
             }
         })
         .await;
-        sleep(Duration::from_millis(500)).await;
+        // Allow provider model refresh to complete before opening `/model`.
+        sleep(Duration::from_millis(2200)).await;
         type_text_with_stabilization(&writer_for_input, "/model").await;
         sleep(Duration::from_millis(120)).await;
         let _ = writer_for_input.send(vec![b'\r']).await;
@@ -974,11 +1244,31 @@ async fn run_codex_cli_with_filter(
         type_text_with_stabilization(&writer_for_input, &filter).await;
         sleep(Duration::from_millis(120)).await;
         let _ = writer_for_input.send(vec![b'\r']).await;
+        // Some models open an effort submenu after model selection.
+        // Confirm only when that submenu is actually shown.
+        let reasoning_prompt_visible = timeout(Duration::from_millis(1400), async {
+            loop {
+                if *reasoning_prompt_rx.borrow() {
+                    break true;
+                }
+                if reasoning_prompt_rx.changed().await.is_err() {
+                    break false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if reasoning_prompt_visible {
+            sleep(Duration::from_millis(200)).await;
+            let _ = writer_for_input.send(vec![b'\r']).await;
+        }
         if let Some(prompt) = prompt_after_switch {
-            // Allow model/effort selection to settle and close the picker before prompt input.
+            // Allow model/effort selection to settle before prompt input.
             sleep(Duration::from_millis(900)).await;
-            let _ = writer_for_input.send(vec![27]).await;
-            sleep(Duration::from_millis(700)).await;
+            if send_escape_before_prompt {
+                let _ = writer_for_input.send(vec![27]).await;
+                sleep(Duration::from_millis(700)).await;
+            }
             type_text_with_stabilization(&writer_for_input, &prompt).await;
             sleep(Duration::from_millis(120)).await;
             let _ = writer_for_input.send(vec![b'\r']).await;
@@ -1012,6 +1302,13 @@ async fn run_codex_cli_with_filter(
                             if startup_ready {
                                 let _ = startup_ready_tx.send(true);
                             }
+                        }
+                        if !*reasoning_prompt_tx.borrow()
+                            && output
+                                .windows(REASONING_CONFIRM_HINT.len())
+                                .any(|window| window == REASONING_CONFIRM_HINT.as_bytes())
+                        {
+                            let _ = reasoning_prompt_tx.send(true);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break exit_rx.await,
@@ -1052,17 +1349,16 @@ async fn run_codex_cli_with_filter(
 }
 
 fn find_codex_cli(cwd: &Path) -> Option<PathBuf> {
-    if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
-        return Some(path);
+    // Always build a fresh local binary once per test process so PTY E2E
+    // assertions exercise the current source tree instead of stale artifacts.
+    if ensure_fallback_codex_binary_is_built(cwd).is_ok() {
+        let fallback = cwd.join("codex-rs/target/debug/codex");
+        if fallback.is_file() {
+            return Some(fallback);
+        }
     }
-    if ensure_fallback_codex_binary_is_built(cwd).is_err() {
-        return None;
-    }
-    let fallback = cwd.join("codex-rs/target/debug/codex");
-    if fallback.is_file() {
-        return Some(fallback);
-    }
-    None
+
+    codex_utils_cargo_bin::cargo_bin("codex").ok()
 }
 
 fn ensure_fallback_codex_binary_is_built(repo_root: &Path) -> Result<()> {
@@ -1186,7 +1482,7 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
                     let body = String::from_utf8_lossy(&body_bytes).to_string();
                     requests.push(format!("{request_line}\n{body}"));
 
-                    let response = if request_line.starts_with("GET /v1/models ") {
+                    let response = if is_models_endpoint_request(&request_line) {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             models_response_body.len(),
@@ -1210,7 +1506,7 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
                         .flush()
                         .context("failed to flush test server response")?;
 
-                    idle_deadline = Some(Instant::now() + Duration::from_secs(8));
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(20));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20));
@@ -1222,6 +1518,85 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
     });
 
     Ok((format!("http://{address}/v1"), handle))
+}
+
+fn spawn_models_dev_catalog_server(
+    response_json: serde_json::Value,
+) -> Result<(String, thread::JoinHandle<Result<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let response_body = response_json.to_string();
+    let handle = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .context("failed to set nonblocking listener")?;
+        let mut requests = Vec::new();
+        let hard_deadline = Instant::now() + Duration::from_secs(20);
+        let mut idle_deadline: Option<Instant> = None;
+        while Instant::now() < hard_deadline
+            && idle_deadline
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(true)
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .context("failed to set read timeout")?;
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                request.extend_from_slice(&chunk[..bytes_read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request).to_string();
+                    let request_line = request.lines().next().unwrap_or_default().to_string();
+                    requests.push(request_line.clone());
+
+                    let response = if request_line.starts_with("GET /api.json ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    stream
+                        .write_all(response.as_bytes())
+                        .context("failed to write models.dev response")?;
+                    stream
+                        .flush()
+                        .context("failed to flush models.dev response")?;
+
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(2));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(requests)
+    });
+
+    Ok((format!("http://{address}/api.json"), handle))
 }
 
 fn spawn_openai_compat_models_with_chat_completions_fallback_server(
@@ -1319,7 +1694,7 @@ fn spawn_openai_compat_models_with_chat_completions_fallback_server(
                     let body = String::from_utf8_lossy(&body_bytes).to_string();
                     requests.push(format!("{request_line}\n{body}"));
 
-                    let response = if request_line.starts_with("GET /v1/models ") {
+                    let response = if is_models_endpoint_request(&request_line) {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             models_response_body.len(),
@@ -1349,7 +1724,7 @@ fn spawn_openai_compat_models_with_chat_completions_fallback_server(
                         .flush()
                         .context("failed to flush test server response")?;
 
-                    idle_deadline = Some(Instant::now() + Duration::from_secs(8));
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(20));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20));
@@ -1518,7 +1893,7 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
                         .flush()
                         .context("failed to flush test server response")?;
 
-                    idle_deadline = Some(Instant::now() + Duration::from_secs(8));
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(20));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20));

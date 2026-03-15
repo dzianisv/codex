@@ -3023,6 +3023,55 @@ fn model_catalog_json_rejects_empty_catalog() -> std::io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn model_providers_config_overrides_built_in_provider_definition() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let override_base_url = "http://127.0.0.1:7777/v1";
+    let override_provider = ModelProviderInfo {
+        name: "GitHub Copilot".to_string(),
+        base_url: Some(override_base_url.to_string()),
+        env_key: Some("GITHUB_COPILOT_TOKEN".to_string()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: crate::WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let cfg = ConfigToml {
+        model_provider: Some("github-copilot".to_string()),
+        model_providers: HashMap::from([("github-copilot".to_string(), override_provider)]),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.model_provider_id, "github-copilot");
+    assert_eq!(
+        config.model_provider.base_url.as_deref(),
+        Some(override_base_url)
+    );
+    assert_eq!(
+        config
+            .model_providers
+            .get("github-copilot")
+            .and_then(|provider| provider.base_url.as_deref()),
+        Some(override_base_url)
+    );
+
+    Ok(())
+}
+
 fn create_test_fixture() -> std::io::Result<PrecedenceTestFixture> {
     let toml = r#"
 model = "o3"
