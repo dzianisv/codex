@@ -76,6 +76,12 @@ fn test_model_info(
     }
 }
 
+async fn mount_models_repeated(server: &MockServer, body: ModelsResponse, times: usize) {
+    for _ in 0..times {
+        let _ = mount_models_once(server, body.clone()).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_appends_model_instructions_developer_message() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -329,11 +335,12 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
         "text only",
         vec![InputModality::Text],
     );
-    mount_models_once(
+    mount_models_repeated(
         &server,
         ModelsResponse {
             models: vec![image_model, text_model],
         },
+        4,
     )
     .await;
 
@@ -347,6 +354,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.model = Some(image_model_slug.to_string());
+            config.model_catalog = None;
         });
     let test = builder.build(&server).await?;
     let models_manager = test.thread_manager.get_models_manager();
@@ -554,11 +562,12 @@ async fn model_change_from_generated_image_to_text_strips_prior_generated_image_
         "text only",
         vec![InputModality::Text],
     );
-    mount_models_once(
+    mount_models_repeated(
         &server,
         ModelsResponse {
             models: vec![image_model, text_model],
         },
+        4,
     )
     .await;
 
@@ -579,6 +588,7 @@ async fn model_change_from_generated_image_to_text_strips_prior_generated_image_
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.model = Some(image_model_slug.to_string());
+            config.model_catalog = None;
         });
     let test = builder.build(&server).await?;
     let models_manager = test.thread_manager.get_models_manager();
@@ -649,7 +659,7 @@ async fn model_change_from_generated_image_to_text_strips_prior_generated_image_
 async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let server = start_mock_server().await;
+    let server = MockServer::start().await;
 
     let large_model_slug = "test-image-model";
     let smaller_model_slug = "test-text-only-model";
@@ -700,11 +710,12 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
     smaller_model.description = Some("smaller context window model".to_string());
     smaller_model.context_window = Some(smaller_context_window);
 
-    mount_models_once(
+    mount_models_repeated(
         &server,
         ModelsResponse {
             models: vec![base_model, smaller_model],
         },
+        4,
     )
     .await;
 
@@ -727,6 +738,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.model = Some(large_model_slug.to_string());
+            config.model_catalog = None;
         });
     let test = builder.build(&server).await?;
 
