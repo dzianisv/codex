@@ -168,7 +168,10 @@ impl ThreadManager {
         collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
         let codex_home = config.codex_home.clone();
-        let configured_provider = config.model_providers.get(&config.model_provider_id).cloned();
+        let configured_provider = config
+            .model_providers
+            .get(&config.model_provider_id)
+            .cloned();
         let models_provider = if config.model_provider.is_openai() {
             configured_provider.unwrap_or_else(|| config.model_provider.clone())
         } else {

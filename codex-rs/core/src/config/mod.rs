@@ -44,13 +44,11 @@ use crate::features::Features;
 use crate::features::FeaturesToml;
 use crate::git_info::resolve_root_git_project_for_trust;
 use crate::memories::memory_root;
-use crate::model_provider_info::GITHUB_COPILOT_PROVIDER_ID;
 use crate::model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use crate::model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
-use crate::model_provider_info::OPENAI_PROVIDER_ID;
 use crate::model_provider_info::built_in_model_providers;
 use crate::path_utils::normalize_for_native_workdir;
 use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
@@ -143,12 +141,6 @@ pub(crate) const DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS: Option<u64> = None;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 const OPENAI_BASE_URL_ENV_VAR: &str = "OPENAI_BASE_URL";
-const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
-    OPENAI_PROVIDER_ID,
-    GITHUB_COPILOT_PROVIDER_ID,
-    OLLAMA_OSS_PROVIDER_ID,
-    LMSTUDIO_OSS_PROVIDER_ID,
-];
 
 fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
     let raw = std::env::var(codex_state::SQLITE_HOME_ENV).ok()?;
@@ -1941,35 +1933,13 @@ pub struct ConfigOverrides {
     pub additional_writable_roots: Vec<PathBuf>,
 }
 
-fn validate_reserved_model_provider_ids(
-    model_providers: &HashMap<String, ModelProviderInfo>,
-) -> Result<(), String> {
-    let mut conflicts = model_providers
-        .keys()
-        .filter(|key| RESERVED_MODEL_PROVIDER_IDS.contains(&key.as_str()))
-        .map(|key| format!("`{key}`"))
-        .collect::<Vec<_>>();
-    conflicts.sort_unstable();
-    if conflicts.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "model_providers contains reserved built-in provider IDs: {}. \
-Built-in providers cannot be overridden. Rename your custom provider (for example, `openai-custom`).",
-            conflicts.join(", ")
-        ))
-    }
-}
-
 fn deserialize_model_providers<'de, D>(
     deserializer: D,
 ) -> Result<HashMap<String, ModelProviderInfo>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let model_providers = HashMap::<String, ModelProviderInfo>::deserialize(deserializer)?;
-    validate_reserved_model_provider_ids(&model_providers).map_err(serde::de::Error::custom)?;
-    Ok(model_providers)
+    HashMap::<String, ModelProviderInfo>::deserialize(deserializer)
 }
 
 /// Resolves the OSS provider from CLI override, profile config, or global config.
@@ -2093,8 +2063,6 @@ impl Config {
         codex_home: PathBuf,
         config_layer_stack: ConfigLayerStack,
     ) -> std::io::Result<Self> {
-        validate_reserved_model_provider_ids(&cfg.model_providers)
-            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
         let ConfigRequirements {
@@ -2359,9 +2327,10 @@ impl Config {
         let effective_openai_base_url = openai_base_url.or(openai_base_url_from_env);
 
         let mut model_providers = built_in_model_providers(effective_openai_base_url);
-        // Merge user-defined providers into the built-in list.
+        // Merge user-defined providers into the built-in list, allowing
+        // config.toml entries to override built-in provider definitions.
         for (key, provider) in cfg.model_providers.into_iter() {
-            model_providers.entry(key).or_insert(provider);
+            model_providers.insert(key, provider);
         }
 
         let model_provider_id = model_provider

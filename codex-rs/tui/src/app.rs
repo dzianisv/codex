@@ -1952,6 +1952,21 @@ impl App {
                 "failed to close all threads"
             );
         }
+        let thread_manager = Arc::new(ThreadManager::new(
+            &self.config,
+            self.auth_manager.clone(),
+            SessionSource::Cli,
+            CollaborationModesConfig {
+                default_mode_request_user_input: self
+                    .config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
+            },
+        ));
+        thread_manager
+            .plugins_manager()
+            .maybe_start_curated_repo_sync_for_config(&self.config);
+        self.server = thread_manager.clone();
         let init = crate::chatwidget::ChatWidgetInit {
             config,
             frame_requester: tui.frame_requester(),
@@ -1960,7 +1975,7 @@ impl App {
             initial_user_message: None,
             enhanced_keys_supported: self.enhanced_keys_supported,
             auth_manager: self.auth_manager.clone(),
-            models_manager: self.server.get_models_manager(),
+            models_manager: thread_manager.get_models_manager(),
             feedback: self.feedback.clone(),
             is_first_run: false,
             feedback_audience: self.feedback_audience,
@@ -1969,7 +1984,7 @@ impl App {
             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
             session_telemetry: self.session_telemetry.clone(),
         };
-        self.chat_widget = ChatWidget::new(init, self.server.clone());
+        self.chat_widget = ChatWidget::new(init, thread_manager);
         self.reset_thread_event_state();
         if let Some(summary) = summary {
             let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
@@ -3249,17 +3264,18 @@ impl App {
                 model,
                 effort,
             } => {
-                let profile = self.active_profile.as_deref();
+                let profile = self.active_profile.clone();
                 let selected_provider = provider
                     .as_deref()
                     .unwrap_or(self.config.model_provider_id.as_str());
+                let selected_provider = selected_provider.to_string();
                 let provider_changed = selected_provider != self.config.model_provider_id;
 
                 let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
+                    .with_profile(profile.as_deref())
                     .set_model(Some(model.as_str()), effort);
                 if let Some(provider_id) = provider.as_deref() {
-                    let segments = if let Some(profile) = profile {
+                    let segments = if let Some(profile) = profile.as_deref() {
                         vec![
                             "profiles".to_string(),
                             profile.to_string(),
@@ -3276,6 +3292,9 @@ impl App {
 
                 match builder.apply().await {
                     Ok(()) => {
+                        if provider_changed {
+                            self.start_fresh_session_with_summary_hint(tui).await;
+                        }
                         let effort_label = effort
                             .map(|selected_effort| selected_effort.to_string())
                             .unwrap_or_else(|| "default".to_string());
@@ -3283,7 +3302,7 @@ impl App {
                             "Selected model: {model}, provider: {selected_provider}, effort: {effort_label}"
                         );
                         let mut message = if provider_changed {
-                            format!("Saved model selection {selected_provider}/{model}")
+                            format!("Applied model selection {selected_provider}/{model}")
                         } else {
                             format!("Model changed to {model}")
                         };
@@ -3292,9 +3311,9 @@ impl App {
                             message.push_str(label);
                         }
                         if provider_changed {
-                            message.push_str(". Start a new session to apply provider change");
+                            message.push_str(". Provider change applied in a fresh session");
                         }
-                        if let Some(profile) = profile {
+                        if let Some(profile) = profile.as_deref() {
                             message.push_str(" for ");
                             message.push_str(profile);
                             message.push_str(" profile");
@@ -3306,7 +3325,7 @@ impl App {
                             error = %err,
                             "failed to persist model selection"
                         );
-                        if let Some(profile) = profile {
+                        if let Some(profile) = profile.as_deref() {
                             self.chat_widget.add_error_message(format!(
                                 "Failed to save model/provider for profile `{profile}`: {err}"
                             ));
