@@ -6247,7 +6247,7 @@ impl ChatWidget {
                     model.as_str(),
                     Some(model_preset.default_reasoning_effort),
                 );
-            let single_supported_effort = model_preset.supported_reasoning_efforts.len() == 1;
+            let single_supported_effort = model_preset.supported_reasoning_efforts.len() <= 1;
             let preset_for_action = model_preset.clone();
             let provider_id_for_action = provider_id.clone();
             let actions: Vec<SelectionAction> = if single_supported_effort {
@@ -6328,7 +6328,7 @@ impl ChatWidget {
                 (!preset.description.is_empty()).then_some(preset.description.to_string());
             let is_current =
                 provider_id == current_provider_id && preset.model.as_str() == self.current_model();
-            let single_supported_effort = preset.supported_reasoning_efforts.len() == 1;
+            let single_supported_effort = preset.supported_reasoning_efforts.len() <= 1;
             let preset_for_action = preset.clone();
             let provider_id_for_action = provider_id.clone();
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {

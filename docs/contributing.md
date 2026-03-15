@@ -50,6 +50,15 @@ When a change updates model catalogs or model metadata (`/models` payloads, pres
 - Ensure client surfaces that accept images (for example, TUI paste/attach) consume the same capability signal.
 - Add/update tests that cover unsupported-image behavior and warning paths.
 
+### Model Switching Acceptance Criteria
+
+When changing model selection behavior, provider model discovery, or model fallback logic:
+
+- Validate with a real CLI/TUI end-to-end test that drives `/model`, selects a model, and submits a prompt in the same session.
+- Assert that the selected model slug is preserved on outbound provider requests (for example `/responses`, and `/chat/completions` if a provider fallback is expected).
+- For provider-backed catalogs (for example GitHub Copilot), assert that `/model` lists all provider models that are picker-enabled from the provider `/models` payload, including models that may be chat-completions-only.
+- Do not mark the work complete until at least one real `codex` binary E2E test and one provider-path regression test covering the changed behavior both pass.
+
 ### Opening a pull request (by invitation only)
 
 - Fill in the PR template (or include similar information) - **What? Why? How?**

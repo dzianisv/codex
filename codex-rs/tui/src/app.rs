@@ -84,6 +84,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
+use color_eyre::eyre::eyre;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -955,6 +956,122 @@ impl App {
         let presets = self.provider_model_presets_for_picker().await;
         self.chat_widget
             .open_model_popup_with_provider_presets(presets);
+    }
+
+    async fn apply_provider_switch_immediately(
+        &mut self,
+        tui: &mut tui::Tui,
+        provider_id: &str,
+        model: &str,
+        effort: Option<ReasoningEffortConfig>,
+    ) -> Result<()> {
+        let current_cwd = self.config.cwd.clone();
+        let mut updated_config = self
+            .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.clone())
+            .await?;
+        self.apply_runtime_policy_overrides(&mut updated_config);
+
+        let provider = updated_config
+            .model_providers
+            .get(provider_id)
+            .cloned()
+            .or_else(|| self.config.model_providers.get(provider_id).cloned())
+            .ok_or_else(|| eyre!("Model provider `{provider_id}` not found in configuration"))?;
+        updated_config.model_provider_id = provider_id.to_string();
+        updated_config.model_provider = provider;
+        updated_config.model = Some(model.to_string());
+        updated_config.model_reasoning_effort = effort;
+        let replacement_server = Arc::new(ThreadManager::new(
+            updated_config.codex_home.clone(),
+            self.auth_manager.clone(),
+            SessionSource::Cli,
+            updated_config.model_catalog.clone(),
+            CollaborationModesConfig {
+                default_mode_request_user_input: updated_config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
+            },
+            updated_config.model_provider.clone(),
+        ));
+        replacement_server
+            .plugins_manager()
+            .maybe_start_curated_repo_sync_for_config(&updated_config);
+        let previous_server = Arc::clone(&self.server);
+
+        // Keep the selection used by resume/new-session bootstraps aligned with what the user picked.
+        self.chat_widget.set_model(model);
+        self.on_update_reasoning_effort(effort);
+
+        if let Some(rollout_path) = self.chat_widget.rollout_path()
+            && rollout_path.exists()
+        {
+            match replacement_server
+                .resume_thread_from_rollout(
+                    updated_config.clone(),
+                    rollout_path.clone(),
+                    self.auth_manager.clone(),
+                )
+                .await
+            {
+                Ok(resumed) => {
+                    self.shutdown_current_thread().await;
+                    if let Err(err) = previous_server.remove_and_close_all_threads().await {
+                        tracing::warn!(error = %err, "failed to close previous threads");
+                    }
+                    self.server = replacement_server;
+                    self.config = updated_config;
+                    tui.set_notification_method(self.config.tui_notification_method);
+                    self.file_search.update_search_dir(self.config.cwd.clone());
+                    let init =
+                        self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+                    self.chat_widget = ChatWidget::new_from_existing(
+                        init,
+                        resumed.thread,
+                        resumed.session_configured,
+                    );
+                    self.reset_thread_event_state();
+                    self.refresh_status_line();
+                    tui.frame_requester().schedule_frame();
+                    return Ok(());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        path = %rollout_path.display(),
+                        "failed to resume active thread after provider switch; starting a fresh session"
+                    );
+                }
+            }
+        }
+
+        self.shutdown_current_thread().await;
+        if let Err(err) = previous_server.remove_and_close_all_threads().await {
+            tracing::warn!(error = %err, "failed to close previous threads");
+        }
+        self.server = replacement_server;
+        self.config = updated_config;
+        let model = self.chat_widget.current_model().to_string();
+        let init = crate::chatwidget::ChatWidgetInit {
+            config: self.fresh_session_config(),
+            frame_requester: tui.frame_requester(),
+            app_event_tx: self.app_event_tx.clone(),
+            initial_user_message: None,
+            enhanced_keys_supported: self.enhanced_keys_supported,
+            auth_manager: self.auth_manager.clone(),
+            models_manager: self.server.get_models_manager(),
+            feedback: self.feedback.clone(),
+            is_first_run: false,
+            feedback_audience: self.feedback_audience,
+            model: Some(model),
+            startup_tooltip_override: None,
+            status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
+            session_telemetry: self.session_telemetry.clone(),
+        };
+        self.chat_widget = ChatWidget::new(init, self.server.clone());
+        self.reset_thread_event_state();
+        tui.frame_requester().schedule_frame();
+        self.refresh_status_line();
+        Ok(())
     }
 
     async fn update_feature_flags(&mut self, updates: Vec<(Feature, bool)>) {
@@ -2924,17 +3041,17 @@ impl App {
                 model,
                 effort,
             } => {
-                let profile = self.active_profile.as_deref();
+                let profile = self.active_profile.clone();
                 let selected_provider = provider
-                    .as_deref()
-                    .unwrap_or(self.config.model_provider_id.as_str());
+                    .clone()
+                    .unwrap_or_else(|| self.config.model_provider_id.clone());
                 let provider_changed = selected_provider != self.config.model_provider_id;
 
                 let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
+                    .with_profile(profile.as_deref())
                     .set_model(Some(model.as_str()), effort);
                 if let Some(provider_id) = provider.as_deref() {
-                    let segments = if let Some(profile) = profile {
+                    let segments = if let Some(profile) = profile.as_deref() {
                         vec![
                             "profiles".to_string(),
                             profile.to_string(),
@@ -2951,13 +3068,39 @@ impl App {
 
                 match builder.apply().await {
                     Ok(()) => {
+                        let provider_applied_immediately = if provider_changed {
+                            match self
+                                .apply_provider_switch_immediately(
+                                    tui,
+                                    selected_provider.as_str(),
+                                    model.as_str(),
+                                    effort,
+                                )
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(err) => {
+                                    tracing::error!(
+                                        error = %err,
+                                        provider = %selected_provider,
+                                        model,
+                                        "failed to apply provider switch immediately"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
                         let effort_label = effort
                             .map(|selected_effort| selected_effort.to_string())
                             .unwrap_or_else(|| "default".to_string());
                         tracing::info!(
                             "Selected model: {model}, provider: {selected_provider}, effort: {effort_label}"
                         );
-                        let mut message = if provider_changed {
+                        let mut message = if provider_changed && provider_applied_immediately {
+                            format!("Model changed to {selected_provider}/{model}")
+                        } else if provider_changed {
                             format!("Saved model selection {selected_provider}/{model}")
                         } else {
                             format!("Model changed to {model}")
@@ -2966,10 +3109,10 @@ impl App {
                             message.push(' ');
                             message.push_str(label);
                         }
-                        if provider_changed {
+                        if provider_changed && !provider_applied_immediately {
                             message.push_str(". Start a new session to apply provider change");
                         }
-                        if let Some(profile) = profile {
+                        if let Some(profile) = profile.as_deref() {
                             message.push_str(" for ");
                             message.push_str(profile);
                             message.push_str(" profile");
@@ -2981,7 +3124,7 @@ impl App {
                             error = %err,
                             "failed to persist model selection"
                         );
-                        if let Some(profile) = profile {
+                        if let Some(profile) = profile.as_deref() {
                             self.chat_widget.add_error_message(format!(
                                 "Failed to save model/provider for profile `{profile}`: {err}"
                             ));

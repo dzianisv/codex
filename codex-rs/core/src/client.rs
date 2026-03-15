@@ -831,10 +831,7 @@ impl ModelClientSession {
                     handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
                     continue;
                 }
-                Err(err)
-                    if self.client.state.provider.is_github_copilot_provider()
-                        && supports_chat_completions_fallback(&err) =>
-                {
+                Err(err) if supports_chat_completions_fallback(&err) => {
                     warn!(
                         model = model_info.slug,
                         "responses api rejected model; falling back to chat/completions"
@@ -854,7 +851,7 @@ impl ModelClientSession {
         let client_setup = self.client.current_client_setup().await?;
         let token = client_setup.api_auth.bearer_token().ok_or_else(|| {
             CodexErr::Stream(
-                "missing auth token for GitHub Copilot chat/completions fallback".to_string(),
+                "missing auth token for chat/completions fallback".to_string(),
                 None,
             )
         })?;
