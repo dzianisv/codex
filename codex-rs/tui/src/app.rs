@@ -3266,9 +3266,8 @@ impl App {
             } => {
                 let profile = self.active_profile.clone();
                 let selected_provider = provider
-                    .as_deref()
-                    .unwrap_or(self.config.model_provider_id.as_str());
-                let selected_provider = selected_provider.to_string();
+                    .clone()
+                    .unwrap_or_else(|| self.config.model_provider_id.clone());
                 let provider_changed = selected_provider != self.config.model_provider_id;
 
                 let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
