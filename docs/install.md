@@ -17,7 +17,7 @@ The GitHub Release also contains a [DotSlash](https://dotslash-cli.com/) file fo
 ```bash
 # Clone the repository and navigate to the root of the Cargo workspace.
 git clone https://github.com/openai/codex.git
-cd codex/codex-rs
+cd codex
 
 # Install the Rust toolchain, if necessary.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -29,7 +29,11 @@ cargo install just
 # Optional: install nextest for the `just test` helper
 cargo install --locked cargo-nextest
 
-# Build Codex.
+# Install a local codex binary with reuse of previous build artifacts.
+./install.sh
+
+# Or build Codex manually from the Rust workspace.
+cd codex-rs
 cargo build
 
 # Launch the TUI with a sample prompt.
