@@ -75,6 +75,7 @@ coverage/
 
 # personal files
 personal/
+.install-codex.lock/
 
 # os
 .DS_Store
