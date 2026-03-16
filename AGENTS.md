@@ -119,7 +119,18 @@ If you don’t have the tool:
 - Do not mark a feature/bugfix task complete until at least one automated end-to-end test against the real `codex` binary passes.
 - Unit tests alone are not sufficient when user-visible behavior is changed.
 - The E2E test must exercise the actual user workflow through CLI/TUI input handling (for example PTY-driven command entry), not only direct internal API calls.
-- For model-switching changes, the E2E path must include `/model` selection and then a real prompt submission in the same session, with assertions on the outbound model used by `/responses`.
+- For model-switching changes, the E2E path must include `/model` selection and then a real prompt submission in the same session, with assertions that the selected model slug is preserved in outbound provider calls (for example `/responses`, and `/chat/completions` when a provider-specific fallback is expected).
+- For model-switching validation, launching `codex exec -m ...` is not sufficient. The required path is: start interactive `codex`, type `/model` in-session via PTY/stdin, select the model from the picker, then submit a real prompt in the same session.
+- Tests and manual verification logs must show that `/model` was actually issued in-session before the prompt turn.
+- For provider-backed model catalogs (for example GitHub Copilot), add coverage that `/model` surfaces all picker-enabled models returned by the provider `/models` endpoint, including entries that may not support `/responses`.
+
+### Model/provider switching guardrails
+
+- Treat provider identity as three separate things that may differ: the config key (`model_provider`), the human-readable provider name (`name`), and the upstream catalog/provider ID (`models.dev` or provider `/models`). Do not assume exact string equality between them.
+- When changing `ModelsManager`, provider aliasing, `models.dev` matching, or provider `/models` handling, add or update at least one regression test with a non-canonical real-world provider name and a non-canonical base URL. Minimum required case: `name = "Azure OpenAI"` must still resolve to the `azure` catalog entry even when the base URL is a proxy or localhost host rather than an Azure hostname.
+- When changing config rebuild, cwd switching, profile switching, or `/model` provider switching, add or update a regression test that proves `active_profile`, `model_provider_id`, and `model` survive the rebuild unless the change is intentionally resetting them.
+- For provider-backed catalogs, discovery coverage alone is not enough. Tests must cover both picker population and post-selection execution, proving that the next outbound request uses the selected model on the correct wire API.
+- When diagnosing provider/model failures, inspect effective config and persisted auth state before blaming missing environment variables. Do not stop at shell env inspection if `auth.json` or profile config can still supply credentials or provider state.
 
 ### Spawning workspace binaries in tests (Cargo vs Bazel)
 
