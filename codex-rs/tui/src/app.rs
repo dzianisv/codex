@@ -825,6 +825,7 @@ impl App {
     async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
         let mut overrides = self.harness_overrides.clone();
         overrides.cwd = Some(cwd.clone());
+        overrides.config_profile = self.active_profile.clone().or(overrides.config_profile);
         let cwd_display = cwd.display().to_string();
         ConfigBuilder::default()
             .codex_home(self.config.codex_home.clone())
@@ -7717,6 +7718,32 @@ guardian_approval = true
             .await;
 
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_config_for_cwd_preserves_active_profile() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        app.active_profile = Some("copilot".to_string());
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            r#"
+model_provider = "openai"
+model = "gpt-5.4"
+
+[profiles.copilot]
+model_provider = "github-copilot"
+model = "claude-opus-4.6"
+"#,
+        )?;
+
+        let rebuilt = app.rebuild_config_for_cwd(app.config.cwd.clone()).await?;
+
+        assert_eq!(rebuilt.active_profile.as_deref(), Some("copilot"));
+        assert_eq!(rebuilt.model_provider_id, "github-copilot");
+        assert_eq!(rebuilt.model.as_deref(), Some("claude-opus-4.6"));
         Ok(())
     }
 
