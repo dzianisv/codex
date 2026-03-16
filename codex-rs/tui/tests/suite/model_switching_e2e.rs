@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
+use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -1400,6 +1401,73 @@ fn ensure_fallback_codex_binary_is_built(repo_root: &Path) -> Result<()> {
     }
 }
 
+fn read_http_request(stream: &mut TcpStream) -> Result<Option<(String, Vec<u8>)>> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .context("failed to set read timeout")?;
+
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                raw.extend_from_slice(&chunk[..bytes_read]);
+                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let Some(header_end) = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+    else {
+        return Ok(None);
+    };
+    let headers = String::from_utf8_lossy(&raw[..header_end]).to_string();
+    let request_line = headers
+        .lines()
+        .next()
+        .context("missing request line")?
+        .to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .strip_prefix("content-length:")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+
+    let mut body = raw[header_end..].to_vec();
+    while body.len() < content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(bytes_read) => body.extend_from_slice(&chunk[..bytes_read]),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(Some((request_line, body)))
+}
+
 fn spawn_openai_compat_models_and_responses_server(
     models_response_json: serde_json::Value,
     response_model: &str,
@@ -1432,68 +1500,9 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
         {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .context("failed to set read timeout")?;
-
-                    let mut raw_request = Vec::new();
-                    let mut chunk = [0_u8; 1024];
-                    loop {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(bytes_read) => {
-                                raw_request.extend_from_slice(&chunk[..bytes_read]);
-                                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
-                                    break;
-                                }
-                            }
-                            Err(err)
-                                if err.kind() == std::io::ErrorKind::WouldBlock
-                                    || err.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                break;
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
-
-                    let header_end = raw_request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                        .context("HTTP headers terminator not found")?;
-                    let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_string();
-                    let request_line = headers
-                        .lines()
-                        .next()
-                        .context("missing request line")?
-                        .to_string();
-
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let lower = line.to_ascii_lowercase();
-                            lower
-                                .strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-
-                    let mut body_bytes = raw_request[header_end..].to_vec();
-                    while body_bytes.len() < content_length {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(bytes_read) => body_bytes.extend_from_slice(&chunk[..bytes_read]),
-                            Err(err)
-                                if err.kind() == std::io::ErrorKind::WouldBlock
-                                    || err.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                break;
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
-
+                    let Some((request_line, body_bytes)) = read_http_request(&mut stream)? else {
+                        continue;
+                    };
                     let body = String::from_utf8_lossy(&body_bytes).to_string();
                     requests.push(format!("{request_line}\n{body}"));
 
@@ -1644,68 +1653,9 @@ fn spawn_openai_compat_models_with_chat_completions_fallback_server(
         {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .context("failed to set read timeout")?;
-
-                    let mut raw_request = Vec::new();
-                    let mut chunk = [0_u8; 1024];
-                    loop {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(bytes_read) => {
-                                raw_request.extend_from_slice(&chunk[..bytes_read]);
-                                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
-                                    break;
-                                }
-                            }
-                            Err(err)
-                                if err.kind() == std::io::ErrorKind::WouldBlock
-                                    || err.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                break;
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
-
-                    let header_end = raw_request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                        .context("HTTP headers terminator not found")?;
-                    let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_string();
-                    let request_line = headers
-                        .lines()
-                        .next()
-                        .context("missing request line")?
-                        .to_string();
-
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let lower = line.to_ascii_lowercase();
-                            lower
-                                .strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-
-                    let mut body_bytes = raw_request[header_end..].to_vec();
-                    while body_bytes.len() < content_length {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(bytes_read) => body_bytes.extend_from_slice(&chunk[..bytes_read]),
-                            Err(err)
-                                if err.kind() == std::io::ErrorKind::WouldBlock
-                                    || err.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                break;
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
-
+                    let Some((request_line, body_bytes)) = read_http_request(&mut stream)? else {
+                        continue;
+                    };
                     let body = String::from_utf8_lossy(&body_bytes).to_string();
                     requests.push(format!("{request_line}\n{body}"));
 
@@ -1819,68 +1769,9 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
         {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .context("failed to set read timeout")?;
-
-                    let mut raw_request = Vec::new();
-                    let mut chunk = [0_u8; 1024];
-                    loop {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(bytes_read) => {
-                                raw_request.extend_from_slice(&chunk[..bytes_read]);
-                                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
-                                    break;
-                                }
-                            }
-                            Err(err)
-                                if err.kind() == std::io::ErrorKind::WouldBlock
-                                    || err.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                break;
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
-
-                    let header_end = raw_request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                        .context("HTTP headers terminator not found")?;
-                    let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_string();
-                    let request_line = headers
-                        .lines()
-                        .next()
-                        .context("missing request line")?
-                        .to_string();
-
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let lower = line.to_ascii_lowercase();
-                            lower
-                                .strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-
-                    let mut body_bytes = raw_request[header_end..].to_vec();
-                    while body_bytes.len() < content_length {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(bytes_read) => body_bytes.extend_from_slice(&chunk[..bytes_read]),
-                            Err(err)
-                                if err.kind() == std::io::ErrorKind::WouldBlock
-                                    || err.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                break;
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
-
+                    let Some((request_line, body_bytes)) = read_http_request(&mut stream)? else {
+                        continue;
+                    };
                     let body = String::from_utf8_lossy(&body_bytes).to_string();
                     requests.push(format!("{request_line}\n{body}"));
 
@@ -1919,11 +1810,7 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
         Ok(requests)
     });
 
-    Ok((
-        provider_api.clone(),
-        format!("http://{address}/api.json"),
-        handle,
-    ))
+    Ok((provider_api, format!("http://{address}/api.json"), handle))
 }
 
 async fn type_text_with_stabilization(writer: &tokio::sync::mpsc::Sender<Vec<u8>>, text: &str) {
