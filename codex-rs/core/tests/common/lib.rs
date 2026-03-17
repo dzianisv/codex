@@ -15,7 +15,6 @@ use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
-use serde_json;
 use std::path::PathBuf;
 
 pub mod apps_test_server;
