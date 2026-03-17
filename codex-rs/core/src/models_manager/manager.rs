@@ -586,7 +586,7 @@ impl ModelsManager {
         let mut models = payload
             .data
             .into_iter()
-            .filter(|model| model.is_picker_enabled())
+            .filter(OpenAiCompatModel::is_picker_enabled)
             .collect::<Vec<_>>();
         models.sort_by_key(|model| !model.supports_responses_endpoint());
         let model_ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
@@ -649,7 +649,7 @@ impl ModelsManager {
         let model_ids = payload
             .models
             .into_iter()
-            .filter(|model| model.is_picker_enabled())
+            .filter(OllamaTagsModel::is_picker_enabled)
             .map(|model| model.name)
             .collect::<Vec<_>>();
         let models = self.map_provider_model_ids(model_ids);
@@ -842,7 +842,7 @@ impl ModelsManager {
     fn extract_host_from_url(input: &str) -> Option<String> {
         reqwest::Url::parse(input)
             .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
     }
 
     fn ollama_tags_url(base_url: &str) -> String {

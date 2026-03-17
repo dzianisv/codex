@@ -5669,7 +5669,10 @@ pub(crate) async fn run_turn(
 
                     // Run reflection if enabled and we haven't exceeded max attempts.
                     let max_attempts = reflection_config.max_attempts;
-                    if reflection_enabled && reflection_attempt < max_attempts {
+                    if reflection_enabled
+                        && reflection_attempt < max_attempts
+                        && let Some(reflection_model_info) = reflection_model_info.as_ref()
+                    {
                         reflection_attempt += 1;
                         info!(
                             "Running reflection evaluation (attempt {}/{})",
@@ -5687,9 +5690,6 @@ pub(crate) async fn run_turn(
                             max_attempts,
                         );
 
-                        let reflection_model_info = reflection_model_info
-                            .as_ref()
-                            .expect("reflection model info");
                         match evaluate_reflection(
                             &sess.services.model_client,
                             reflection_model_info,
