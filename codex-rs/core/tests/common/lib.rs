@@ -159,6 +159,10 @@ pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
     config
 }
 
+pub fn is_default_test_model_catalog(model_catalog: &ModelsResponse) -> bool {
+    *model_catalog == build_test_model_catalog(None)
+}
+
 fn build_test_model_catalog(existing: Option<ModelsResponse>) -> ModelsResponse {
     let mut response = existing.unwrap_or_else(|| {
         serde_json::from_str(include_str!("../../models.json"))
@@ -333,7 +337,38 @@ pub fn format_with_current_shell_display_non_login(command: &str) -> String {
 }
 
 pub fn stdio_server_bin() -> Result<String, CargoBinError> {
-    codex_utils_cargo_bin::cargo_bin("test_stdio_server").map(|p| p.to_string_lossy().to_string())
+    workspace_binary("codex-rmcp-client", "test_stdio_server")
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+fn workspace_binary(package: &str, binary: &str) -> Result<PathBuf, CargoBinError> {
+    match codex_utils_cargo_bin::cargo_bin(binary) {
+        Ok(path) => Ok(path),
+        Err(original_err) => {
+            if codex_utils_cargo_bin::runfiles_available() {
+                return Err(original_err);
+            }
+
+            let Ok(repo_root) = codex_utils_cargo_bin::repo_root() else {
+                return Err(original_err);
+            };
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let status = std::process::Command::new(cargo)
+                .current_dir(repo_root.join("codex-rs"))
+                .arg("build")
+                .arg("-p")
+                .arg(package)
+                .arg("--bin")
+                .arg(binary)
+                .status();
+            match status {
+                Ok(status) if status.success() => {
+                    codex_utils_cargo_bin::cargo_bin(binary).map_err(|_| original_err)
+                }
+                _ => Err(original_err),
+            }
+        }
+    }
 }
 
 pub mod fs_wait {
