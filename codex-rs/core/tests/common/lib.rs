@@ -158,10 +158,22 @@ pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
     config
 }
 
+fn load_bundled_models_response() -> anyhow::Result<ModelsResponse> {
+    let bundled_models_path = codex_utils_cargo_bin::find_resource!("../../models.json")
+        .context("bundled models.json")?;
+    let bundled_models_contents =
+        std::fs::read_to_string(&bundled_models_path).with_context(|| {
+            format!(
+                "read bundled models.json from {}",
+                bundled_models_path.display()
+            )
+        })?;
+    serde_json::from_str(&bundled_models_contents).context("parse bundled models.json")
+}
+
 fn build_test_model_catalog(existing: Option<ModelsResponse>) -> ModelsResponse {
     let mut response = existing.unwrap_or_else(|| {
-        serde_json::from_str(include_str!("../../models.json"))
-            .expect("bundled models.json should parse")
+        load_bundled_models_response().expect("bundled models.json should load")
     });
 
     add_test_model(
