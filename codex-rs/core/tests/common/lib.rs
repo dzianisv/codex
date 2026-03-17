@@ -174,7 +174,6 @@ fn load_bundled_models_response() -> anyhow::Result<ModelsResponse> {
         })?;
     serde_json::from_str(&bundled_models_contents).context("parse bundled models.json")
 }
-
 fn build_test_model_catalog(existing: Option<ModelsResponse>) -> ModelsResponse {
     let mut response = existing.unwrap_or_else(|| {
         load_bundled_models_response().expect("bundled models.json should load")
@@ -356,7 +355,6 @@ fn workspace_binary(package: &str, binary: &str) -> Result<PathBuf, CargoBinErro
     if let Some(path) = sibling_test_binary(binary) {
         return Ok(path);
     }
-
     match codex_utils_cargo_bin::cargo_bin(binary) {
         Ok(path) => Ok(path),
         Err(original_err) => {
