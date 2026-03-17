@@ -5,3 +5,6 @@ pnpm-lock.yaml
 prompt.md
 *_prompt.md
 *_instructions.md
+
+# Vendored parser bundle; keep upstream minified formatting intact.
+codex-rs/core/src/tools/js_repl/meriyah.umd.min.js
