@@ -79,13 +79,16 @@ def expand_packages(packages: list[str]) -> list[str]:
 
 
 def resolve_release_workflow(version: str) -> dict:
+    release_branch = f"rust-v{version}"
     stdout = subprocess.check_output(
         [
             "gh",
             "run",
             "list",
+            "-R",
+            GITHUB_REPO,
             "--branch",
-            f"rust-v{version}",
+            release_branch,
             "--json",
             "workflowName,url,headSha",
             "--workflow",
@@ -98,7 +101,10 @@ def resolve_release_workflow(version: str) -> dict:
     )
     workflow = json.loads(stdout or "null")
     if not workflow:
-        raise RuntimeError(f"Unable to find rust-release workflow for version {version}.")
+        raise RuntimeError(
+            "Unable to find rust-release workflow for version "
+            f"{version} in {GITHUB_REPO} (branch {release_branch}, workflow {WORKFLOW_NAME})."
+        )
     return workflow
 
 
