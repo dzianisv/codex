@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set");
+    let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") else {
+        println!("cargo:rustc-env=CODEX_CLI_VERSION=unknown");
+        return;
+    };
     let repo_root = Path::new(&manifest_dir).join("../..");
 
     configure_git_rerun_inputs(&repo_root);

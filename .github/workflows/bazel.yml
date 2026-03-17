@@ -20,32 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # macOS
-          - os: macos-15-xlarge
-            fallback_os: macos-15
-            target: aarch64-apple-darwin
-          - os: macos-15-xlarge
-            fallback_os: macos-15-intel
-            target: x86_64-apple-darwin
-
-          # Linux
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-          # 2026-02-27 Bazel tests have been flaky on arm in CI.
-          # Disable until we can investigate and stabilize them.
-          # - os: ubuntu-24.04-arm
-          #   target: aarch64-unknown-linux-musl
-          # - os: ubuntu-24.04-arm
-          #   target: aarch64-unknown-linux-gnu
-
-          # TODO: Enable Windows once we fix the toolchain issues there.
-          #- os: windows-latest
-          #  target: x86_64-pc-windows-gnullvm
+        include: ${{ fromJSON(github.repository == 'openai/codex' && '[{"os":"macos-15-xlarge","fallback_os":"macos-15","target":"aarch64-apple-darwin"},{"os":"macos-15-xlarge","fallback_os":"macos-15-intel","target":"x86_64-apple-darwin"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl"}]' || '[{"os":"macos-15-xlarge","fallback_os":"macos-15","target":"aarch64-apple-darwin"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu"}]') }}
     # macOS larger runners are available in upstream, but forks should fall back
-    # to the standard hosted labels that match the target architecture.
+    # to the standard hosted labels that match the target architecture. Forks
+    # also use a reduced hosted subset for now because the hosted Intel macOS
+    # and Linux musl Bazel lanes are not stable in this fork's CI environment.
     runs-on: ${{ github.repository == 'openai/codex' && matrix.os || matrix.fallback_os || matrix.os }}
 
     # Configure a human readable name for each job
