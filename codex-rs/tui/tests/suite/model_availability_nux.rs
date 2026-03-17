@@ -53,14 +53,17 @@ async fn resume_startup_does_not_consume_model_availability_nux_count() -> Resul
         serde_json::to_string(&source_catalog)?,
     )?;
 
-    let repo_root_display = repo_root.display();
-    let catalog_display = custom_catalog_path.display();
+    let repo_root_display = repo_root.display().to_string();
+    let repo_root_toml = toml::Value::String(repo_root_display).to_string();
+    let catalog_display = custom_catalog_path.display().to_string();
+    let catalog_toml = toml::Value::String(catalog_display).to_string();
+    let model_slug_toml = toml::Value::String(model_slug.clone()).to_string();
     let config_contents = format!(
-        r#"model = "{model_slug}"
+        r#"model = {model_slug_toml}
 model_provider = "openai"
-model_catalog_json = "{catalog_display}"
+model_catalog_json = {catalog_toml}
 
-[projects."{repo_root_display}"]
+[projects.{repo_root_toml}]
 trust_level = "trusted"
 
 [tui.model_availability_nux]
@@ -71,10 +74,16 @@ trust_level = "trusted"
 
     let fixture_path =
         codex_utils_cargo_bin::find_resource!("../core/tests/cli_responses_fixture.sse")?;
-    let codex = if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+    let codex = if let Some(path) = sibling_test_binary("codex") {
+        path
+    } else if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
         path
     } else {
-        let fallback = repo_root.join("codex-rs/target/debug/codex");
+        let fallback = repo_root
+            .join("codex-rs")
+            .join("target")
+            .join("debug")
+            .join(format!("codex{}", std::env::consts::EXE_SUFFIX));
         if fallback.is_file() {
             fallback
         } else {
@@ -194,4 +203,11 @@ trust_level = "trusted"
     assert_eq!(shown_count, 1);
 
     Ok(())
+}
+
+fn sibling_test_binary(binary: &str) -> Option<std::path::PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let profile_dir = current_exe.parent()?.parent()?;
+    let candidate = profile_dir.join(format!("{binary}{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
 }

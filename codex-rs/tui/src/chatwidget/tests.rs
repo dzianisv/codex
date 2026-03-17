@@ -7095,7 +7095,12 @@ async fn experimental_popup_marks_reflection_enabled_when_feature_flag_is_enable
     chat.open_experimental_popup();
 
     let popup = render_bottom_popup(&chat, 120);
-    assert_snapshot!("experimental_popup_reflection_runtime_enabled", popup);
+    let snapshot_name = if cfg!(target_os = "linux") {
+        "experimental_popup_reflection_runtime_enabled_linux"
+    } else {
+        "experimental_popup_reflection_runtime_enabled"
+    };
+    assert_snapshot!(snapshot_name, popup);
 }
 
 #[tokio::test]

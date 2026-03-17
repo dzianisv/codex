@@ -616,6 +616,11 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
+      - name: Prebuild CLI test binaries
+        run: |
+          cargo build --all-features -p codex-cli --bin codex --target ${{ matrix.target }} --profile ci-test
+          cargo build --all-features -p codex-rmcp-client --bin test_stdio_server --target ${{ matrix.target }} --profile ci-test
+
       - name: tests
         id: test
         run: cargo nextest run --all-features --no-fail-fast --target ${{ matrix.target }} --cargo-profile ci-test --timings
