@@ -23,8 +23,10 @@ jobs:
         include:
           # macOS
           - os: macos-15-xlarge
+            fallback_os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-xlarge
+            fallback_os: macos-15-intel
             target: x86_64-apple-darwin
 
           # Linux
@@ -42,10 +44,12 @@ jobs:
           # TODO: Enable Windows once we fix the toolchain issues there.
           #- os: windows-latest
           #  target: x86_64-pc-windows-gnullvm
-    runs-on: ${{ matrix.os }}
+    # macOS larger runners are available in upstream, but forks should fall back
+    # to the standard hosted labels that match the target architecture.
+    runs-on: ${{ github.repository == 'openai/codex' && matrix.os || matrix.fallback_os || matrix.os }}
 
     # Configure a human readable name for each job
-    name: Local Bazel build on ${{ matrix.os }} for ${{ matrix.target }}
+    name: Local Bazel build on ${{ github.repository == 'openai/codex' && matrix.os || matrix.fallback_os || matrix.os }} for ${{ matrix.target }}
 
     steps:
       - uses: actions/checkout@v6
