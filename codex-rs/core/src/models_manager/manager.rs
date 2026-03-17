@@ -15,6 +15,7 @@ use crate::models_manager::model_info;
 use codex_api::AuthProvider;
 use codex_api::ModelsClient;
 use codex_api::ReqwestTransport;
+use codex_api::is_azure_responses_wire_base_url;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
@@ -52,11 +53,21 @@ struct OpenAiCompatModel {
     id: String,
     #[serde(default)]
     model_picker_enabled: Option<bool>,
+    #[serde(default)]
+    supported_endpoints: Vec<String>,
 }
 
 impl OpenAiCompatModel {
     fn is_picker_enabled(&self) -> bool {
         !matches!(self.model_picker_enabled, Some(false))
+    }
+
+    fn supports_responses_endpoint(&self) -> bool {
+        self.supported_endpoints.is_empty()
+            || self
+                .supported_endpoints
+                .iter()
+                .any(|endpoint| endpoint.trim_end_matches('/').ends_with("/responses"))
     }
 }
 
@@ -572,12 +583,13 @@ impl ModelsManager {
             .json()
             .await
             .map_err(|err| CodexErr::Stream(err.to_string(), None))?;
-        let model_ids = payload
+        let mut models = payload
             .data
             .into_iter()
             .filter(|model| model.is_picker_enabled())
-            .map(|model| model.id)
             .collect::<Vec<_>>();
+        models.sort_by_key(|model| !model.supports_responses_endpoint());
+        let model_ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
         let models = self.map_provider_model_ids(model_ids);
         Ok((models, etag))
     }
@@ -726,14 +738,17 @@ impl ModelsManager {
         &self,
         catalog: &'a HashMap<String, ModelsDevProvider>,
     ) -> Option<(&'a str, &'a ModelsDevProvider)> {
-        let normalized_name = Self::normalize_provider_key(&self.provider.name);
-        if let Some((provider_id, provider)) = catalog.get_key_value(&normalized_name) {
-            return Some((provider_id.as_str(), provider));
+        for provider_alias in self.models_dev_provider_aliases() {
+            if let Some((provider_id, provider)) = catalog.get_key_value(&provider_alias) {
+                return Some((provider_id.as_str(), provider));
+            }
         }
-        if let Some((provider_id, provider)) = catalog
-            .iter()
-            .find(|(_, provider)| Self::normalize_provider_key(&provider.name) == normalized_name)
-        {
+        if let Some((provider_id, provider)) = catalog.iter().find(|(_, provider)| {
+            let normalized_provider_name = Self::normalize_provider_key(&provider.name);
+            self.models_dev_provider_aliases()
+                .iter()
+                .any(|alias| alias == &normalized_provider_name)
+        }) {
             return Some((provider_id.as_str(), provider));
         }
 
@@ -759,6 +774,26 @@ impl ModelsManager {
             return None;
         }
         Some((first_match.0.as_str(), first_match.1))
+    }
+
+    fn models_dev_provider_aliases(&self) -> Vec<String> {
+        let normalized_provider_name = Self::normalize_provider_key(&self.provider.name);
+        let mut aliases = vec![normalized_provider_name.clone()];
+        let azure_named_provider = normalized_provider_name
+            .split('-')
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|window| window == ["azure", "openai"]);
+        if (azure_named_provider
+            || is_azure_responses_wire_base_url(
+                &self.provider.name,
+                self.provider.base_url.as_deref(),
+            ))
+            && !aliases.iter().any(|alias| alias == "azure")
+        {
+            aliases.push("azure".to_string());
+        }
+        aliases
     }
 
     fn map_models_dev_provider(&self, provider: &ModelsDevProvider) -> Vec<ModelInfo> {
@@ -2360,6 +2395,72 @@ mod tests {
                 .iter()
                 .any(|preset| preset.model == "claude-host-match"),
             "expected provider host fallback to match models.dev provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_dev_provider_match_accepts_azure_openai_alias() {
+        let models_dev_server = MockServer::start().await;
+        let _models_dev = wiremock::Mock::given(method("GET"))
+            .and(path("/api.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "azure": {
+                    "id": "azure",
+                    "name": "Azure",
+                    "models": {
+                        "azure-model-a": {
+                            "id": "azure-model-a",
+                            "name": "Azure Model A",
+                            "release_date": "2026-01-01",
+                            "attachment": false,
+                            "reasoning": true,
+                            "temperature": true,
+                            "tool_call": true,
+                            "limit": {"context": 128000, "output": 4096},
+                            "options": {}
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&models_dev_server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+        let provider = ModelProviderInfo {
+            name: "Azure OpenAI".to_string(),
+            base_url: Some("http://127.0.0.1:9/openai".to_string()),
+            env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: Some(
+                [("api-version".to_string(), "2025-04-01-preview".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            stream_idle_timeout_ms: Some(5_000),
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+        let manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+            format!("{}/api.json", models_dev_server.uri()),
+        );
+
+        let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "azure-model-a"),
+            "expected Azure OpenAI alias to match models.dev Azure provider"
         );
     }
 
