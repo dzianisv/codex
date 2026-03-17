@@ -7,6 +7,7 @@ The reflection layer is an experimental feature that verifies if the AI agent co
 1. **Task Execution**: Agent executes the user's request using tools (shell, file operations, etc.)
 
 2. **Evaluation**: After completion, the reflection layer:
+
    - Collects context: original task, recent tool calls (up to 10), and final response
    - Sends this to a judge model for evaluation
    - Receives a verdict with completion status and confidence score
@@ -60,6 +61,7 @@ cargo test -p codex-core --test all --release reflection_layer_hello_world -- --
 ```
 
 The test verifies:
+
 1. Azure OpenAI integration with reflection enabled
 2. Agent creates requested Python files
 3. Tests pass via pytest
@@ -71,13 +73,14 @@ The eval suite measures the reflection layer's impact on coding task performance
 
 ### Tasks
 
-| Task | Description | Bug Type |
-|------|-------------|----------|
+| Task   | Description       | Bug Type                                |
+| ------ | ----------------- | --------------------------------------- |
 | Task 1 | Off-by-one errors | `range(n+1)` → `range(n)`, index errors |
-| Task 2 | String logic | Palindrome detection, word counting |
-| Task 3 | Edge cases | Division by zero, empty list handling |
+| Task 2 | String logic      | Palindrome detection, word counting     |
+| Task 3 | Edge cases        | Division by zero, empty list handling   |
 
 Each task provides:
+
 - A buggy Python codebase
 - An issue description (like a GitHub issue)
 - Test files that verify the fix
@@ -123,6 +126,7 @@ Improvement: +1 tasks
 ```
 
 The reflection layer helps catch incomplete fixes by re-evaluating the agent's work and providing feedback for another attempt.
+
 ## Local Debugging
 
 ### Prerequisites
@@ -159,6 +163,7 @@ fi
 ```
 
 Notes:
+
 - Using `install -m 755` sets the executable bit and is safer than `cp`.
 - Avoid using `sudo` unless installing to system locations like `/usr/local/bin`.
 

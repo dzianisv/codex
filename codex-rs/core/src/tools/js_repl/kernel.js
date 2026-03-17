@@ -9,9 +9,12 @@ const { builtinModules, createRequire } = require("node:module");
 const { createInterface } = require("node:readline");
 const { performance } = require("node:perf_hooks");
 const path = require("node:path");
-const { URL, URLSearchParams, fileURLToPath, pathToFileURL } = require(
-  "node:url",
-);
+const {
+  URL,
+  URLSearchParams,
+  fileURLToPath,
+  pathToFileURL,
+} = require("node:url");
 const { inspect, TextDecoder, TextEncoder } = require("node:util");
 const vm = require("node:vm");
 
@@ -318,7 +321,9 @@ function resolvePathSpecifier(specifier, referrerIdentifier = null) {
     try {
       candidate = fileURLToPath(new URL(specifier));
     } catch (err) {
-      throw new Error(`Failed to resolve module "${specifier}": ${err.message}`);
+      throw new Error(
+        `Failed to resolve module "${specifier}": ${err.message}`,
+      );
     }
   } else {
     const baseDir =
@@ -440,14 +445,19 @@ async function loadLinkedFileModule(modulePath) {
         setImportMeta(meta, mod, false);
       },
       importModuleDynamically(specifier, referrer) {
-        return importResolved(resolveSpecifier(specifier, referrer?.identifier));
+        return importResolved(
+          resolveSpecifier(specifier, referrer?.identifier),
+        );
       },
     });
     linkedFileModules.set(modulePath, module);
   }
   if (module.status === "unlinked") {
     await module.link(async (specifier, referencingModule) => {
-      const resolved = resolveSpecifier(specifier, referencingModule?.identifier);
+      const resolved = resolveSpecifier(
+        specifier,
+        referencingModule?.identifier,
+      );
       if (resolved.kind !== "file") {
         throw new Error(
           `Static import "${specifier}" is not supported from js_repl local files. Use await import("${specifier}") instead.`,
@@ -599,7 +609,10 @@ function instrumentVariableDeclarationSource(
     return code.slice(declaration.start, declaration.end);
   }
 
-  const prefix = code.slice(declaration.start, declaration.declarations[0].start);
+  const prefix = code.slice(
+    declaration.start,
+    declaration.declarations[0].start,
+  );
   const suffix = code.slice(
     declaration.declarations[declaration.declarations.length - 1].end,
     declaration.end,
@@ -699,10 +712,7 @@ function collectHoistedVarDeclarationStarts(ast) {
 function collectFutureVarWriteReplacements(
   code,
   ast,
-  {
-    helperDeclarations = null,
-    markCommittedFnName = null,
-  } = {},
+  { helperDeclarations = null, markCommittedFnName = null } = {},
 ) {
   // Failed-cell hoisted tracking intentionally stays small here. We only mark
   // direct top-level writes to future `var` bindings, plus top-level
@@ -790,11 +800,7 @@ function collectFutureVarWriteReplacements(
       const helperName = nextInternalBindingName();
       helperDeclarations.push(`let ${helperName};`);
       const shortCircuitOperator =
-        node.operator === "&&="
-          ? "&&"
-          : node.operator === "||="
-            ? "||"
-            : "??";
+        node.operator === "&&=" ? "&&" : node.operator === "||=" ? "||" : "??";
       addReplacement(
         node.start,
         node.end,
@@ -1045,11 +1051,7 @@ async function buildModuleSource(code) {
 }
 
 function canReadCommittedBinding(module, binding) {
-  if (
-    !module ||
-    binding.kind === "var" ||
-    binding.kind === "function"
-  ) {
+  if (!module || binding.kind === "var" || binding.kind === "function") {
     return false;
   }
 
@@ -1321,7 +1323,9 @@ function normalizeMcpImageData(data, mimeType) {
     return data;
   }
   const normalizedMimeType =
-    typeof mimeType === "string" && mimeType ? mimeType : "application/octet-stream";
+    typeof mimeType === "string" && mimeType
+      ? mimeType
+      : "application/octet-stream";
   return `data:${normalizedMimeType};base64,${data}`;
 }
 
@@ -1336,7 +1340,10 @@ function parseMcpToolResult(result) {
 
   if ("Err" in result) {
     const error = result.Err;
-    return { images: [], textCount: typeof error === "string" && error ? 1 : 0 };
+    return {
+      images: [],
+      textCount: typeof error === "string" && error ? 1 : 0,
+    };
   }
 
   if (!("Ok" in result)) {
@@ -1356,7 +1363,10 @@ function parseMcpToolResult(result) {
     }
     if (item.type === "image") {
       images.push({
-        image_url: normalizeMcpImageData(item.data, item.mimeType ?? item.mime_type),
+        image_url: normalizeMcpImageData(
+          item.data,
+          item.mimeType ?? item.mime_type,
+        ),
       });
       continue;
     }
@@ -1374,7 +1384,9 @@ function parseMcpToolResult(result) {
 
 function requireSingleImage(parsed) {
   if (parsed.textCount > 0) {
-    throw new Error("codex.emitImage does not accept mixed text and image content");
+    throw new Error(
+      "codex.emitImage does not accept mixed text and image content",
+    );
   }
   if (parsed.images.length !== 1) {
     throw new Error("codex.emitImage expected exactly one image");
@@ -1556,7 +1568,9 @@ async function handleExec(message) {
           meta.__codexInternalMarkPreludeCompleted = markPreludeCompleted;
         },
         importModuleDynamically(specifier, referrer) {
-          return importResolved(resolveSpecifier(specifier, referrer?.identifier));
+          return importResolved(
+            resolveSpecifier(specifier, referrer?.identifier),
+          );
         },
       });
 
@@ -1587,7 +1601,9 @@ async function handleExec(message) {
 
       await module.evaluate();
       if (pendingBackgroundTasks.size > 0) {
-        const backgroundResults = await Promise.all([...pendingBackgroundTasks]);
+        const backgroundResults = await Promise.all([
+          ...pendingBackgroundTasks,
+        ]);
         const firstUnhandledBackgroundError = backgroundResults.find(
           (result) => !result.ok && !result.observation.observed,
         );
@@ -1611,11 +1627,11 @@ async function handleExec(message) {
   } catch (error) {
     const { bindings: committedBindings, committedCurrentBindingCount } =
       collectCommittedBindings(
-      moduleLinked ? module : null,
-      priorBindings,
-      currentBindings,
-      committedCurrentBindingNames,
-    );
+        moduleLinked ? module : null,
+        priorBindings,
+        currentBindings,
+        committedCurrentBindingNames,
+      );
     // Preserve the last successfully linked module across link-time failures.
     // A module whose link step failed cannot safely back @prev because reading
     // its namespace throws before evaluation ever begins. Likewise, if a
