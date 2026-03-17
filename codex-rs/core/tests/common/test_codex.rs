@@ -183,7 +183,11 @@ impl TestCodexBuilder {
         resume_from: Option<PathBuf>,
     ) -> anyhow::Result<TestCodex> {
         let auth = self.auth.clone();
-        let thread_manager = if config.model_catalog.is_some() {
+        let use_authoritative_model_catalog = config
+            .model_catalog
+            .as_ref()
+            .is_some_and(|model_catalog| !crate::is_default_test_model_catalog(model_catalog));
+        let thread_manager = if use_authoritative_model_catalog {
             ThreadManager::new(
                 &config,
                 codex_core::test_support::auth_manager_from_auth(auth.clone()),
@@ -557,8 +561,12 @@ pub fn test_codex() -> TestCodexBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::responses::mount_models_once;
+    use codex_core::models_manager::manager::RefreshStrategy;
+    use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use wiremock::MockServer;
 
     #[test]
     fn custom_tool_call_output_text_returns_output_text() {
@@ -584,5 +592,116 @@ mod tests {
         })];
 
         let _ = custom_tool_call_output_text(&bodies, "call-2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_test_model_catalog_still_allows_remote_model_refresh() {
+        let server = MockServer::start().await;
+        let mut remote_catalog =
+            crate::load_bundled_models_response().expect("valid bundled models.json");
+        let remote_slug = "test-codex-builder-remote";
+        let remote_model = remote_catalog
+            .models
+            .iter_mut()
+            .find(|model| model.slug == "gpt-5.1")
+            .expect("gpt-5.1 should exist in bundled models.json");
+        remote_model.slug = remote_slug.to_string();
+        remote_model.display_name = remote_slug.to_string();
+        let models_mock = mount_models_once(
+            &server,
+            ModelsResponse {
+                models: vec![remote_model.clone()],
+            },
+        )
+        .await;
+
+        let mut builder =
+            test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let test = builder
+            .build(&server)
+            .await
+            .expect("build test codex with remote provider");
+
+        let available = test
+            .thread_manager
+            .get_models_manager()
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await;
+
+        assert!(
+            available.iter().any(|model| model.model == remote_slug),
+            "default test catalog should not block remote models refresh: {available:?}"
+        );
+        assert_eq!(
+            models_mock.requests().len(),
+            1,
+            "default test catalog should still hit /models exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_model_catalog_remains_authoritative() {
+        let server = MockServer::start().await;
+        let mut remote_catalog =
+            crate::load_bundled_models_response().expect("valid bundled models.json");
+        let remote_slug = "test-codex-builder-remote";
+        let remote_model = remote_catalog
+            .models
+            .iter_mut()
+            .find(|model| model.slug == "gpt-5.1")
+            .expect("gpt-5.1 should exist in bundled models.json");
+        remote_model.slug = remote_slug.to_string();
+        remote_model.display_name = remote_slug.to_string();
+        let models_mock = mount_models_once(
+            &server,
+            ModelsResponse {
+                models: vec![remote_model.clone()],
+            },
+        )
+        .await;
+
+        let mut custom_catalog =
+            crate::load_bundled_models_response().expect("valid bundled models.json");
+        custom_catalog.models.truncate(1);
+        let custom_model = custom_catalog
+            .models
+            .first_mut()
+            .expect("custom catalog should include one model");
+        custom_model.slug = "custom-catalog-only".to_string();
+        custom_model.display_name = "custom-catalog-only".to_string();
+
+        let custom_catalog_for_config = custom_catalog.clone();
+        let mut builder = test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(move |config| {
+                config.model = Some("custom-catalog-only".to_string());
+                config.model_catalog = Some(custom_catalog_for_config);
+            });
+        let test = builder
+            .build(&server)
+            .await
+            .expect("build test codex with custom catalog");
+
+        let available = test
+            .thread_manager
+            .get_models_manager()
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await;
+
+        assert!(
+            available
+                .iter()
+                .any(|model| model.model == "custom-catalog-only"),
+            "explicit custom catalog should stay available: {available:?}"
+        );
+        assert!(
+            !available.iter().any(|model| model.model == remote_slug),
+            "explicit custom catalog should ignore remote /models refresh: {available:?}"
+        );
+        assert_eq!(
+            models_mock.requests().len(),
+            0,
+            "explicit custom catalog should not fetch /models"
+        );
     }
 }

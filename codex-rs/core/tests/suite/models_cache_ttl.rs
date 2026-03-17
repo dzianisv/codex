@@ -137,7 +137,9 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uses_cache_when_version_matches() -> Result<()> {
     let server = MockServer::start().await;
+    let base_url = format!("{}/v1", server.uri());
     let cached_model = test_remote_model(VERSIONED_MODEL, 1);
+    let provider_scope = openai_chatgpt_provider_scope(&base_url);
     let models_mock = responses::mount_models_once(
         &server,
         ModelsResponse {
@@ -153,6 +155,7 @@ async fn uses_cache_when_version_matches() -> Result<()> {
                 fetched_at: Utc::now(),
                 etag: None,
                 client_version: Some(codex_core::models_manager::client_version_to_whole()),
+                provider_scope: Some(provider_scope),
                 models: vec![cached_model],
             };
             let cache_path = home.join(CACHE_FILE);
@@ -184,7 +187,9 @@ async fn uses_cache_when_version_matches() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refreshes_when_cache_version_missing() -> Result<()> {
     let server = MockServer::start().await;
+    let base_url = format!("{}/v1", server.uri());
     let cached_model = test_remote_model(MISSING_VERSION_MODEL, 1);
+    let provider_scope = openai_chatgpt_provider_scope(&base_url);
     let models_mock = responses::mount_models_once(
         &server,
         ModelsResponse {
@@ -200,6 +205,7 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
                 fetched_at: Utc::now(),
                 etag: None,
                 client_version: None,
+                provider_scope: Some(provider_scope),
                 models: vec![cached_model],
             };
             let cache_path = home.join(CACHE_FILE);
@@ -231,7 +237,9 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refreshes_when_cache_version_differs() -> Result<()> {
     let server = MockServer::start().await;
+    let base_url = format!("{}/v1", server.uri());
     let cached_model = test_remote_model(DIFFERENT_VERSION_MODEL, 1);
+    let provider_scope = openai_chatgpt_provider_scope(&base_url);
     let models_response = ModelsResponse {
         models: vec![test_remote_model("remote-different", 2)],
     };
@@ -248,6 +256,7 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
                 fetched_at: Utc::now(),
                 etag: None,
                 client_version: Some(format!("{client_version}-diff")),
+                provider_scope: Some(provider_scope),
                 models: vec![cached_model],
             };
             let cache_path = home.join(CACHE_FILE);
@@ -303,6 +312,10 @@ fn write_cache_sync(path: &Path, cache: &ModelsCache) -> Result<()> {
     Ok(())
 }
 
+fn openai_chatgpt_provider_scope(base_url: &str) -> String {
+    format!("provider_name=OpenAI;base_url={base_url};auth_mode=Some(Chatgpt)")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModelsCache {
     fetched_at: DateTime<Utc>,
@@ -310,6 +323,8 @@ struct ModelsCache {
     etag: Option<String>,
     #[serde(default)]
     client_version: Option<String>,
+    #[serde(default)]
+    provider_scope: Option<String>,
     models: Vec<ModelInfo>,
 }
 

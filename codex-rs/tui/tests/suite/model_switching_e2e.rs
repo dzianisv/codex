@@ -839,13 +839,15 @@ async fn cross_provider_model_switch_applies_immediately_without_manual_new_sess
 fn tempdir_with_ollama_config(repo_root: &Path, model: &str) -> Result<TempDir> {
     let codex_home = tempfile::tempdir()?;
 
-    let repo_root_display = repo_root.display();
+    let repo_root_display = repo_root.display().to_string();
+    let repo_root_toml = toml::Value::String(repo_root_display).to_string();
+    let model_toml = toml::Value::String(model.to_string()).to_string();
     let config_contents = format!(
         r#"model_provider = "ollama"
-model = "{model}"
+model = {model_toml}
 cli_auth_credentials_store = "file"
 
-[projects."{repo_root_display}"]
+[projects.{repo_root_toml}]
 trust_level = "trusted"
 "#
     );
@@ -884,21 +886,25 @@ fn tempdir_with_github_copilot_config(
         serde_json::to_string(&source_catalog)?,
     )?;
 
-    let repo_root_display = repo_root.display();
-    let catalog_display = custom_catalog_path.display();
+    let repo_root_display = repo_root.display().to_string();
+    let repo_root_toml = toml::Value::String(repo_root_display).to_string();
+    let catalog_display = custom_catalog_path.display().to_string();
+    let catalog_toml = toml::Value::String(catalog_display).to_string();
+    let model_toml = toml::Value::String(model.to_string()).to_string();
+    let base_url_toml = toml::Value::String(base_url.to_string()).to_string();
     let config_contents = format!(
         r#"model_provider = "github-copilot"
-model = "{model}"
-model_catalog_json = "{catalog_display}"
+model = {model_toml}
+model_catalog_json = {catalog_toml}
 cli_auth_credentials_store = "file"
 
 [model_providers.github-copilot]
 name = "GitHub Copilot"
-base_url = "{base_url}"
+base_url = {base_url_toml}
 env_key = "GITHUB_COPILOT_TOKEN"
 wire_api = "responses"
 
-[projects."{repo_root_display}"]
+[projects.{repo_root_toml}]
 trust_level = "trusted"
 "#
     );
@@ -917,19 +923,25 @@ fn tempdir_with_models_dev_provider_config(
 ) -> Result<TempDir> {
     let codex_home = tempfile::tempdir()?;
 
-    let repo_root_display = repo_root.display();
+    let repo_root_display = repo_root.display().to_string();
+    let repo_root_toml = toml::Value::String(repo_root_display).to_string();
+    let provider_id_toml = toml::Value::String(provider_id.to_string()).to_string();
+    let provider_name_toml = toml::Value::String(provider_name.to_string()).to_string();
+    let model_toml = toml::Value::String(model.to_string()).to_string();
+    let base_url_toml = toml::Value::String(base_url.to_string()).to_string();
+    let env_key_toml = toml::Value::String(env_key.to_string()).to_string();
     let config_contents = format!(
-        r#"model_provider = "{provider_id}"
-model = "{model}"
+        r#"model_provider = {provider_id_toml}
+model = {model_toml}
 cli_auth_credentials_store = "file"
 
 [model_providers.{provider_id}]
-name = "{provider_name}"
-base_url = "{base_url}"
-env_key = "{env_key}"
+name = {provider_name_toml}
+base_url = {base_url_toml}
+env_key = {env_key_toml}
 wire_api = "responses"
 
-[projects."{repo_root_display}"]
+[projects.{repo_root_toml}]
 trust_level = "trusted"
 "#
     );
@@ -946,25 +958,29 @@ fn tempdir_with_dual_provider_config(
 ) -> Result<TempDir> {
     let codex_home = tempfile::tempdir()?;
 
-    let repo_root_display = repo_root.display();
+    let repo_root_display = repo_root.display().to_string();
+    let repo_root_toml = toml::Value::String(repo_root_display).to_string();
+    let startup_model_toml = toml::Value::String(startup_model.to_string()).to_string();
+    let azure_base_url_toml = toml::Value::String(azure_base_url.to_string()).to_string();
+    let copilot_base_url_toml = toml::Value::String(copilot_base_url.to_string()).to_string();
     let config_contents = format!(
         r#"model_provider = "azure-local"
-model = "{startup_model}"
+model = {startup_model_toml}
 cli_auth_credentials_store = "file"
 
 [model_providers.azure-local]
 name = "Azure"
-base_url = "{azure_base_url}"
+base_url = {azure_base_url_toml}
 env_key = "AZURE_TEST_KEY"
 wire_api = "responses"
 
 [model_providers.github-copilot]
 name = "GitHub Copilot"
-base_url = "{copilot_base_url}"
+base_url = {copilot_base_url_toml}
 env_key = "GITHUB_COPILOT_TOKEN"
 wire_api = "responses"
 
-[projects."{repo_root_display}"]
+[projects.{repo_root_toml}]
 trust_level = "trusted"
 "#
     );
@@ -1375,15 +1391,15 @@ fn find_codex_cli(cwd: &Path) -> Option<PathBuf> {
         return Some(path);
     }
 
-    // When Cargo did not export the test-run binary path, build and use a
-    // fresh fallback binary once per process so PTY E2E coverage cannot drift
-    // onto a stale target artifact.
-    if ensure_fallback_codex_binary_is_built(cwd).is_err() {
-        return None;
+    if let Some(path) = sibling_test_binary("codex") {
+        return Some(path);
     }
-    let fallback = cwd.join("codex-rs/target/debug/codex");
-    if fallback.is_file() {
-        return Some(fallback);
+
+    if ensure_fallback_codex_binary_is_built(cwd).is_ok() {
+        return sibling_test_binary("codex").or_else(|| {
+            let fallback = debug_target_binary(cwd, "codex");
+            fallback.is_file().then_some(fallback)
+        });
     }
 
     None
@@ -1405,6 +1421,8 @@ fn ensure_fallback_codex_binary_is_built(repo_root: &Path) -> Result<()> {
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_PROFILE_DEV_DEBUG", "0")
             .arg("build")
+            .arg("-p")
+            .arg("codex-cli")
             .arg("--bin")
             .arg("codex")
             .current_dir(repo_root.join("codex-rs"))
@@ -1422,6 +1440,21 @@ fn ensure_fallback_codex_binary_is_built(repo_root: &Path) -> Result<()> {
             "failed to build fallback codex binary: {err}"
         )),
     }
+}
+
+fn sibling_test_binary(binary: &str) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let profile_dir = current_exe.parent()?.parent()?;
+    let candidate = profile_dir.join(format!("{binary}{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
+}
+
+fn debug_target_binary(repo_root: &Path, binary: &str) -> PathBuf {
+    repo_root
+        .join("codex-rs")
+        .join("target")
+        .join("debug")
+        .join(format!("{binary}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn spawn_openai_compat_models_and_responses_server(

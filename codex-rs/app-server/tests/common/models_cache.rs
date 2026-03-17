@@ -51,6 +51,10 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
     }
 }
 
+fn default_openai_provider_scope() -> String {
+    "provider_name=OpenAI;base_url=https://api.openai.com/v1;auth_mode=None".to_string()
+}
+
 /// Write a models_cache.json file to the codex home directory.
 /// This prevents ModelsManager from making network requests to refresh models.
 /// The cache will be treated as fresh (within TTL) and used instead of fetching from the network.
@@ -90,6 +94,7 @@ pub fn write_models_cache_with_models(
         "fetched_at": fetched_at,
         "etag": null,
         "client_version": client_version,
+        "provider_scope": default_openai_provider_scope(),
         "models": models
     });
     std::fs::write(cache_path, serde_json::to_string_pretty(&cache)?)
