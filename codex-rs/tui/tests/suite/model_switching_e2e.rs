@@ -1189,6 +1189,7 @@ async fn run_codex_cli_with_filter(
     .await
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn run_codex_cli_with_filter_options(
     codex_cli: &Path,
     codex_home: &Path,
@@ -1753,13 +1754,15 @@ fn spawn_openai_compat_models_with_chat_completions_fallback_server(
     Ok((format!("http://{address}/v1"), handle))
 }
 
+type ResponsesServerHandle = thread::JoinHandle<Result<Vec<String>>>;
+
 fn spawn_models_dev_and_responses_server(
     models_dev_provider_id: &str,
     models_dev_provider_name: &str,
     model_ids: &[&str],
     response_model: &str,
     answer_text: &str,
-) -> Result<(String, String, thread::JoinHandle<Result<Vec<String>>>)> {
+) -> Result<(String, String, ResponsesServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
 
@@ -1919,11 +1922,7 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
         Ok(requests)
     });
 
-    Ok((
-        provider_api.clone(),
-        format!("http://{address}/api.json"),
-        handle,
-    ))
+    Ok((provider_api, format!("http://{address}/api.json"), handle))
 }
 
 async fn type_text_with_stabilization(writer: &tokio::sync::mpsc::Sender<Vec<u8>>, text: &str) {

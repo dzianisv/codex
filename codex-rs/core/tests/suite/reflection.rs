@@ -21,6 +21,7 @@ use std::process::Stdio;
 use std::thread;
 use tempfile::TempDir;
 
+#[expect(clippy::expect_used)]
 fn require_azure_credentials() -> (String, String, String) {
     let api_key = std::env::var("AZURE_OPENAI_API_KEY")
         .expect("AZURE_OPENAI_API_KEY env var not set — skip running Azure tests");
@@ -73,6 +74,7 @@ fn run_azure_reflection_test(
     prompt: &str,
 ) -> (assert_cmd::assert::Assert, TempDir, Vec<u8>, Vec<u8>) {
     #![expect(clippy::unwrap_used)]
+    #![expect(clippy::expect_used)]
 
     let (api_key, base_url, model) = require_azure_credentials();
 
@@ -87,7 +89,7 @@ fn run_azure_reflection_test(
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("codex").unwrap();
+    let mut cmd = Command::new(codex_utils_cargo_bin::cargo_bin("codex").unwrap());
     cmd.current_dir(dir.path());
     cmd.env("AZURE_OPENAI_API_KEY", api_key);
     cmd.env("CODEX_HOME", &codex_home);
