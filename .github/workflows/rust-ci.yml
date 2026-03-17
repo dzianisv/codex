@@ -520,9 +520,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Set up Node.js for js_repl tests
+        if: ${{ matrix.target != 'aarch64-pc-windows-msvc' }}
         uses: actions/setup-node@v6
         with:
           node-version-file: codex-rs/node-version.txt
+      - name: Set up x64 Node.js for js_repl tests (Windows ARM)
+        if: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: codex-rs/node-version.txt
+          architecture: x64
       - name: Install Linux build dependencies
         if: ${{ runner.os == 'Linux' }}
         shell: bash
