@@ -781,12 +781,8 @@ async fn cli_copilot_provider_models_request_omits_openai_intent_header() {
 
     // Verify a /responses request was made, proving the Gemini model was
     // accepted and used for the prompt.
-    let responses_requests: Vec<_> = requests
-        .iter()
-        .filter(|r| r.url.path().contains("/responses"))
-        .collect();
     assert!(
-        !responses_requests.is_empty(),
+        requests.iter().any(|r| r.url.path().contains("/responses")),
         "expected a POST /responses request, proving gemini-2.5-pro was \
          accepted as a valid model from the copilot provider"
     );

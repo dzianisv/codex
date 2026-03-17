@@ -12,7 +12,6 @@
 //!     cargo test -p codex-core --test all eval_swe -- --ignored --nocapture
 //! ```
 
-use assert_cmd::prelude::*;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -21,6 +20,7 @@ use std::process::Stdio;
 use std::thread;
 use tempfile::TempDir;
 
+#[expect(clippy::expect_used)]
 fn require_azure_credentials() -> (String, String, String) {
     let api_key =
         std::env::var("AZURE_OPENAI_API_KEY").expect("AZURE_OPENAI_API_KEY env var not set");
@@ -89,6 +89,7 @@ fn run_eval_task(
     reflection_enabled: bool,
 ) -> EvalResult {
     #![expect(clippy::unwrap_used)]
+    #![expect(clippy::expect_used)]
 
     let (api_key, base_url, model) = require_azure_credentials();
 
@@ -114,7 +115,7 @@ fn run_eval_task(
     .unwrap();
 
     // Run codex
-    let mut cmd = Command::cargo_bin("codex").unwrap();
+    let mut cmd = Command::new(codex_utils_cargo_bin::cargo_bin("codex").unwrap());
     cmd.current_dir(work_dir);
     cmd.env("AZURE_OPENAI_API_KEY", api_key);
     cmd.env("CODEX_HOME", &codex_home);
