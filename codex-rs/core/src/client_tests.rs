@@ -1,9 +1,12 @@
 use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
+use super::synthesize_chat_completions_output_items;
 use super::UnauthorizedRecoveryExecution;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -115,4 +118,57 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     assert!(auth_context.retry_after_unauthorized);
     assert_eq!(auth_context.recovery_mode, Some("managed"));
     assert_eq!(auth_context.recovery_phase, Some("refresh_token"));
+}
+
+#[test]
+fn synthesize_chat_completions_output_items_converts_claude_tool_wrappers() {
+    let items = synthesize_chat_completions_output_items(
+        "before<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}</tool_call><tool_result>ok</tool_result>after",
+    );
+
+    assert_eq!(items.len(), 4);
+    assert!(matches!(
+        &items[0],
+        ResponseItem::Message { role, content, .. }
+            if role == "assistant"
+                && matches!(
+                    content.first(),
+                    Some(codex_protocol::models::ContentItem::OutputText { text }) if text == "before"
+                )
+    ));
+    assert!(matches!(
+        &items[1],
+        ResponseItem::FunctionCall { name, arguments, .. }
+            if name == "shell" && arguments == "{\"command\":\"pwd\"}"
+    ));
+    assert!(matches!(
+        &items[2],
+        ResponseItem::FunctionCallOutput { output, .. }
+            if matches!(&output.body, FunctionCallOutputBody::Text(text) if text == "ok")
+    ));
+    assert!(matches!(
+        &items[3],
+        ResponseItem::Message { role, content, .. }
+            if role == "assistant"
+                && matches!(
+                    content.first(),
+                    Some(codex_protocol::models::ContentItem::OutputText { text }) if text == "after"
+                )
+    ));
+}
+
+#[test]
+fn synthesize_chat_completions_output_items_leaves_plain_text_unchanged() {
+    let items = synthesize_chat_completions_output_items("plain assistant text");
+
+    assert_eq!(items.len(), 1);
+    assert!(matches!(
+        &items[0],
+        ResponseItem::Message { role, content, .. }
+            if role == "assistant"
+                && matches!(
+                    content.first(),
+                    Some(codex_protocol::models::ContentItem::OutputText { text }) if text == "plain assistant text"
+                )
+    ));
 }

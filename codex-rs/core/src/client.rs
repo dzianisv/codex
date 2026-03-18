@@ -65,6 +65,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -1163,18 +1164,13 @@ impl ModelClientSession {
                 None,
             )
         })?;
+        let completion_items = synthesize_chat_completions_output_items(&assistant_text);
 
         let (tx_event, rx_event) = mpsc::channel(8);
         let _ = tx_event.try_send(Ok(ResponseEvent::Created));
-        let _ = tx_event.try_send(Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: assistant_text,
-            }],
-            end_turn: None,
-            phase: None,
-        })));
+        for item in completion_items {
+            let _ = tx_event.try_send(Ok(ResponseEvent::OutputItemDone(item)));
+        }
         let _ = tx_event.try_send(Ok(ResponseEvent::Completed {
             response_id,
             token_usage: None,
@@ -1586,6 +1582,98 @@ fn extract_chat_completions_text(response_json: &JsonValue) -> Option<String> {
             Some(joined)
         }
     })
+}
+
+fn synthesize_chat_completions_output_items(text: &str) -> Vec<ResponseItem> {
+    let parsed = parse_claude_tool_wrapper_blocks(text);
+    if parsed.is_empty() {
+        return vec![assistant_message_item(text.to_string())];
+    }
+
+    let mut items = Vec::new();
+    for item in parsed {
+        items.push(item);
+    }
+    items
+}
+
+fn assistant_message_item(text: String) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText { text }],
+        end_turn: None,
+        phase: None,
+    }
+}
+
+fn parse_claude_tool_wrapper_blocks(text: &str) -> Vec<ResponseItem> {
+    let mut items = Vec::new();
+    let mut remaining = text;
+    let mut tool_index = 0usize;
+
+    while let Some(start) = remaining.find("<tool_call>") {
+        let before = &remaining[..start];
+        if !before.is_empty() {
+            items.push(assistant_message_item(before.to_string()));
+        }
+
+        let after_open = &remaining[start + "<tool_call>".len()..];
+        let Some(end_call) = after_open.find("</tool_call>") else {
+            return vec![assistant_message_item(text.to_string())];
+        };
+        let tool_call_payload = after_open[..end_call].trim();
+        let after_call = &after_open[end_call + "</tool_call>".len()..];
+
+        let Some(result_start) = after_call.find("<tool_result>") else {
+            return vec![assistant_message_item(text.to_string())];
+        };
+        let between = &after_call[..result_start];
+        if !between.is_empty() {
+            items.push(assistant_message_item(between.to_string()));
+        }
+
+        let after_result_open = &after_call[result_start + "<tool_result>".len()..];
+        let Some(end_result) = after_result_open.find("</tool_result>") else {
+            return vec![assistant_message_item(text.to_string())];
+        };
+        let tool_result_payload = after_result_open[..end_result].trim();
+        remaining = &after_result_open[end_result + "</tool_result>".len()..];
+
+        let Ok(tool_call_json) = serde_json::from_str::<JsonValue>(tool_call_payload) else {
+            return vec![assistant_message_item(text.to_string())];
+        };
+        let Some(name) = tool_call_json
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .map(ToString::to_string)
+        else {
+            return vec![assistant_message_item(text.to_string())];
+        };
+        let arguments = tool_call_json
+            .get("arguments")
+            .cloned()
+            .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+        let call_id = format!("chat-completions-tool-call-{tool_index}");
+        tool_index += 1;
+        items.push(ResponseItem::FunctionCall {
+            id: None,
+            name,
+            namespace: None,
+            arguments: arguments.to_string(),
+            call_id: call_id.clone(),
+        });
+        items.push(ResponseItem::FunctionCallOutput {
+            call_id,
+            output: FunctionCallOutputPayload::from_text(tool_result_payload.to_string()),
+        });
+    }
+
+    if !remaining.is_empty() {
+        items.push(assistant_message_item(remaining.to_string()));
+    }
+
+    items
 }
 
 fn map_response_stream<S>(

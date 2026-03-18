@@ -68,6 +68,7 @@ fn last_assistant_message_from_item_returns_none_for_plan_only_hidden_message() 
     assert_eq!(last_assistant_message_from_item(&item, true), None);
 }
 
+
 #[tokio::test]
 async fn save_image_generation_result_saves_base64_to_png_in_temp_dir() {
     let expected_path = std::env::temp_dir().join("ig_save_base64.png");

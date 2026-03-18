@@ -8227,6 +8227,7 @@ impl ChatWidget {
 
     /// Set the model in the widget's config copy and stored collaboration mode.
     pub(crate) fn set_model(&mut self, model: &str) {
+        self.config.model = Some(model.to_string());
         self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
             Some(model.to_string()),
             /*effort*/ None,
@@ -9436,6 +9437,10 @@ impl ChatWidget {
     /// runtime overrides applied via TUI, e.g., model or approval policy).
     pub(crate) fn config_ref(&self) -> &Config {
         &self.config
+    }
+
+    pub(crate) fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
     }
 
     #[cfg(test)]
