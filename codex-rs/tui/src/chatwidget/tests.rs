@@ -8327,7 +8327,7 @@ async fn model_picker_switches_to_azure_model_and_back_without_runtime_switch() 
 }
 
 #[tokio::test]
-async fn model_picker_switches_from_gpt5_3_to_copilot_claude_without_runtime_switch() {
+async fn model_picker_switches_from_gpt5_3_to_copilot_claude_with_runtime_switch() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
     chat.config.model_provider_id = "azure".to_string();
     chat.set_model("gpt-5.3-codex");
@@ -8393,16 +8393,19 @@ async fn model_picker_switches_from_gpt5_3_to_copilot_claude_without_runtime_swi
         "expected persisted Copilot Claude model selection; events: {switch_events:?}"
     );
     assert!(
-        !switch_events
+        switch_events
             .iter()
-            .any(|event| matches!(event, AppEvent::UpdateModel(_))),
-        "did not expect in-session model update for provider switch; events: {switch_events:?}"
+            .any(|event| matches!(event, AppEvent::UpdateModel(model) if model == "claude-opus-4.6")),
+        "expected in-session model update for provider switch; events: {switch_events:?}"
     );
     assert!(
-        !switch_events
+        switch_events
             .iter()
-            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(_))),
-        "did not expect in-session reasoning update for provider switch; events: {switch_events:?}"
+            .any(|event| matches!(
+                event,
+                AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Medium))
+            )),
+        "expected in-session reasoning update for provider switch; events: {switch_events:?}"
     );
 }
 

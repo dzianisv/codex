@@ -3047,6 +3047,18 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| self.config.model_provider_id.clone());
                 let provider_changed = selected_provider != self.config.model_provider_id;
+                if provider_changed {
+                    if let Some(provider_info) =
+                        self.config.model_providers.get(&selected_provider).cloned()
+                    {
+                        self.config.model_provider = provider_info.clone();
+                        self.chat_widget.config_mut().model_provider = provider_info;
+                    }
+                    self.config.model_provider_id = selected_provider.clone();
+                    self.chat_widget.config_mut().model_provider_id = selected_provider.clone();
+                    self.chat_widget.set_model(&model);
+                    self.refresh_status_line();
+                }
 
                 let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
                     .with_profile(profile.as_deref())
@@ -6760,6 +6772,63 @@ model = "claude-opus-4.6"
         assert_eq!(rebuilt.active_profile.as_deref(), Some("copilot"));
         assert_eq!(rebuilt.model_provider_id, "github-copilot");
         assert_eq!(rebuilt.model.as_deref(), Some("claude-opus-4.6"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_model_selection_switches_provider_in_runtime() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            r#"
+model_provider = "openai"
+model = "gpt-5.4"
+"#,
+        )?;
+
+        let copilot_provider = codex_core::ModelProviderInfo::create_github_copilot_provider();
+        app.config
+            .model_providers
+            .insert("github-copilot".to_string(), copilot_provider.clone());
+        app.chat_widget
+            .config_mut()
+            .model_providers
+            .insert("github-copilot".to_string(), copilot_provider);
+
+        let mut tui = crate::tui::tests::create_test_tui()?;
+        let control = app
+            .handle_event(
+                &mut tui,
+                AppEvent::PersistModelSelection {
+                    provider: Some("github-copilot".to_string()),
+                    model: "claude-4.6-opus".to_string(),
+                    effort: None,
+                },
+            )
+            .await?;
+
+        assert!(matches!(control, AppRunControl::Continue));
+        assert_eq!(app.config.model_provider_id, "github-copilot");
+        assert_eq!(app.config.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            app.chat_widget.config_ref().model_provider_id,
+            "github-copilot"
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().model.as_deref(),
+            Some("claude-4.6-opus")
+        );
+        assert_eq!(app.chat_widget.current_model(), "claude-4.6-opus");
+
+        let rebuilt = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        assert_eq!(rebuilt.model_provider_id, "github-copilot");
+        assert_eq!(rebuilt.model.as_deref(), Some("claude-4.6-opus"));
+
         Ok(())
     }
 
