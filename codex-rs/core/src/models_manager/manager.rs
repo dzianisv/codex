@@ -474,10 +474,7 @@ impl ModelsManager {
         candidates: &[ModelInfo],
         config: &Config,
     ) -> ModelInfo {
-        // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
-        // retry for namespaced slugs like `custom/gpt-5.3-codex`.
-        let remote = Self::find_model_by_longest_prefix(model, candidates)
-            .or_else(|| Self::find_model_by_namespaced_suffix(model, candidates));
+        let remote = Self::find_metadata_candidate(model, candidates);
         let model_info = if let Some(remote) = remote {
             ModelInfo {
                 slug: model.to_string(),
@@ -488,6 +485,15 @@ impl ModelsManager {
             model_info::model_info_from_slug(model)
         };
         model_info::with_config_overrides(model_info, config)
+    }
+
+    /// Reuse the same metadata lookup rules for both direct model selection and provider-backed
+    /// model listings.
+    fn find_metadata_candidate(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
+        // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
+        // retry for namespaced slugs like `custom/gpt-5.3-codex`.
+        Self::find_model_by_longest_prefix(model, candidates)
+            .or_else(|| Self::find_model_by_namespaced_suffix(model, candidates))
     }
 
     /// Refresh models if the provided ETag differs from the cached ETag.
@@ -1010,10 +1016,7 @@ impl ModelsManager {
                     return None;
                 }
 
-                let mut candidate = bundled_models
-                    .iter()
-                    .find(|bundled| bundled.slug == model_id)
-                    .cloned()
+                let mut candidate = Self::find_metadata_candidate(&model_id, &bundled_models)
                     .unwrap_or_else(|| model_info::model_info_from_slug(&model_id));
                 candidate.slug = model_id.clone();
                 if candidate.display_name.is_empty() {

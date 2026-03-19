@@ -639,6 +639,93 @@ async fn models_dev_provider_model_switch_then_prompt_uses_selected_model() -> R
 }
 
 #[tokio::test]
+async fn models_dev_provider_alias_model_switch_then_prompt_uses_selected_reasoning_effort()
+-> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
+
+    let prompt = "What year did GPT-1 launch?";
+    let answer_text = "GPT-1 launched in 2018.";
+    let startup_model = "azure/gpt-5.4";
+    let selected_model = "azure/gpt-5.4-pro";
+    let selected_reasoning = "high";
+    let provider_id = "azure-local";
+
+    let (provider_base_url, models_dev_url, server) = spawn_models_dev_and_responses_server(
+        "azure",
+        "Azure",
+        &[startup_model, selected_model],
+        selected_model,
+        answer_text,
+    )?;
+    let codex_home = tempdir_with_models_dev_provider_config(
+        &repo_root,
+        provider_id,
+        "Azure",
+        startup_model,
+        provider_base_url.as_str(),
+        "AZURE_TEST_KEY",
+    )?;
+
+    let mut env = HashMap::new();
+    env.insert("AZURE_TEST_KEY".to_string(), "test-azure-token".to_string());
+    env.insert("CODEX_MODELS_DEV_URL".to_string(), models_dev_url);
+
+    let output = run_codex_cli_with_filter_and_reasoning(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        startup_model,
+        selected_model,
+        Some(selected_reasoning),
+        Some(prompt),
+        env,
+    )
+    .await
+    .context("switch models.dev Azure alias via /model, pick reasoning, and run prompt")?;
+    let requests = server
+        .join()
+        .expect("models.dev/responses server should join")?;
+
+    anyhow::ensure!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("GET /api.json ")),
+        "expected GET /api.json request; got requests: {requests:?}; output: {output}"
+    );
+    assert_model_and_provider_in_config(codex_home.path(), selected_model, provider_id, &output)?;
+    anyhow::ensure!(
+        output.contains("2018"),
+        "expected answer to contain 2018, got output: {output}"
+    );
+    let responses_request = requests
+        .iter()
+        .find(|request| request.starts_with("POST /v1/responses "))
+        .context("missing POST /v1/responses request")?;
+    anyhow::ensure!(
+        responses_request.contains(format!("\"model\":\"{selected_model}\"").as_str()),
+        "expected switched model in /responses request body; request: {responses_request}"
+    );
+    anyhow::ensure!(
+        responses_request.contains("\"reasoning\":{\"effort\":\"high\"}"),
+        "expected selected reasoning effort in /responses request body; request: {responses_request}"
+    );
+    anyhow::ensure!(
+        responses_request.contains(prompt),
+        "expected prompt text in /responses request body; request: {responses_request}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn models_dev_provider_config_parses_custom_provider() -> Result<()> {
     let repo_root = codex_utils_cargo_bin::repo_root()?;
     let codex_home = tempdir_with_models_dev_provider_config(
@@ -1199,6 +1286,31 @@ async fn run_codex_cli_with_filter(
         cwd,
         startup_model_hint,
         filter,
+        None,
+        prompt_after_switch,
+        extra_env,
+        true,
+    )
+    .await
+}
+
+async fn run_codex_cli_with_filter_and_reasoning(
+    codex_cli: &Path,
+    codex_home: &Path,
+    cwd: &Path,
+    startup_model_hint: &str,
+    filter: &str,
+    reasoning_filter: Option<&str>,
+    prompt_after_switch: Option<&str>,
+    extra_env: HashMap<String, String>,
+) -> Result<String> {
+    run_codex_cli_with_filter_options(
+        codex_cli,
+        codex_home,
+        cwd,
+        startup_model_hint,
+        filter,
+        reasoning_filter,
         prompt_after_switch,
         extra_env,
         true,
@@ -1213,6 +1325,7 @@ async fn run_codex_cli_with_filter_options(
     cwd: &Path,
     startup_model_hint: &str,
     filter: &str,
+    reasoning_filter: Option<&str>,
     prompt_after_switch: Option<&str>,
     extra_env: HashMap<String, String>,
     send_escape_before_prompt: bool,
@@ -1254,6 +1367,7 @@ async fn run_codex_cli_with_filter_options(
     let (reasoning_prompt_tx, mut reasoning_prompt_rx) = watch::channel(false);
     const REASONING_CONFIRM_HINT: &str = "Press enter to confirm or esc to go back";
     let filter = filter.to_string();
+    let reasoning_filter = reasoning_filter.map(std::borrow::ToOwned::to_owned);
     let prompt_after_switch = prompt_after_switch.map(std::borrow::ToOwned::to_owned);
     let input_task = tokio::spawn(async move {
         // Wait for startup to finish before dispatching `/model`.
@@ -1293,6 +1407,29 @@ async fn run_codex_cli_with_filter_options(
         .unwrap_or(false);
         if reasoning_prompt_visible {
             sleep(Duration::from_millis(200)).await;
+            if let Some(reasoning_filter) = reasoning_filter.as_ref() {
+                match reasoning_filter.as_str() {
+                    "medium" => {}
+                    "high" => {
+                        let _ = writer_for_input.send(b"\x1b[B".to_vec()).await;
+                        sleep(Duration::from_millis(120)).await;
+                    }
+                    "xhigh" => {
+                        let _ = writer_for_input.send(b"\x1b[B".to_vec()).await;
+                        sleep(Duration::from_millis(120)).await;
+                        let _ = writer_for_input.send(b"\x1b[B".to_vec()).await;
+                        sleep(Duration::from_millis(120)).await;
+                    }
+                    "low" => {
+                        let _ = writer_for_input.send(b"\x1b[A".to_vec()).await;
+                        sleep(Duration::from_millis(120)).await;
+                    }
+                    _ => {
+                        type_text_with_stabilization(&writer_for_input, reasoning_filter).await;
+                        sleep(Duration::from_millis(120)).await;
+                    }
+                }
+            }
             let _ = writer_for_input.send(vec![b'\r']).await;
         }
         if let Some(prompt) = prompt_after_switch {
