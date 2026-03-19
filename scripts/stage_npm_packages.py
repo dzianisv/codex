@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_SCRIPT = REPO_ROOT / "codex-cli" / "scripts" / "build_npm_package.py"
 INSTALL_NATIVE_DEPS = REPO_ROOT / "codex-cli" / "scripts" / "install_native_deps.py"
 WORKFLOW_NAME = ".github/workflows/rust-release.yml"
-GITHUB_REPO = "openai/codex"
+DEFAULT_GITHUB_REPO = "openai/codex"
 
 _SPEC = importlib.util.spec_from_file_location("codex_build_npm_package", BUILD_SCRIPT)
 if _SPEC is None or _SPEC.loader is None:
@@ -78,34 +79,84 @@ def expand_packages(packages: list[str]) -> list[str]:
     return expanded
 
 
+def normalize_github_repo(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+
+    if re.fullmatch(r"[^/]+/[^/]+", stripped):
+        return stripped.removesuffix(".git")
+
+    ssh_match = re.match(r"git@github\.com:(?P<repo>[^\s]+?)(?:\.git)?$", stripped)
+    if ssh_match:
+        return ssh_match.group("repo")
+
+    https_match = re.match(r"https://github\.com/(?P<repo>[^\s]+?)(?:\.git)?/?$", stripped)
+    if https_match:
+        return https_match.group("repo")
+
+    return None
+
+
+def get_github_repo() -> str:
+    env_repo = normalize_github_repo(os.environ.get("GITHUB_REPOSITORY"))
+    if env_repo:
+        return env_repo
+
+    try:
+        remote_url = subprocess.check_output(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=REPO_ROOT,
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return DEFAULT_GITHUB_REPO
+
+    return normalize_github_repo(remote_url) or DEFAULT_GITHUB_REPO
+
+
 def resolve_release_workflow(version: str) -> dict:
     release_branch = f"rust-v{version}"
-    stdout = subprocess.check_output(
-        [
-            "gh",
-            "run",
-            "list",
-            "-R",
-            GITHUB_REPO,
-            "--branch",
-            release_branch,
-            "--json",
-            "workflowName,url,headSha",
-            "--workflow",
-            WORKFLOW_NAME,
-            "--jq",
-            "first(.[])",
-        ],
-        cwd=REPO_ROOT,
-        text=True,
+    candidate_repos = [get_github_repo()]
+    if DEFAULT_GITHUB_REPO not in candidate_repos:
+        candidate_repos.append(DEFAULT_GITHUB_REPO)
+
+    for github_repo in candidate_repos:
+        try:
+            stdout = subprocess.check_output(
+                [
+                    "gh",
+                    "run",
+                    "list",
+                    "-R",
+                    github_repo,
+                    "--branch",
+                    release_branch,
+                    "--json",
+                    "workflowName,url,headSha",
+                    "--workflow",
+                    WORKFLOW_NAME,
+                    "--jq",
+                    "first(.[])",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+
+        workflow = json.loads(stdout or "null")
+        if workflow:
+            return workflow
+
+    repo_list = ", ".join(candidate_repos)
+    raise RuntimeError(
+        "Unable to find rust-release workflow for version "
+        f"{version} in any of [{repo_list}] (branch {release_branch}, workflow {WORKFLOW_NAME})."
     )
-    workflow = json.loads(stdout or "null")
-    if not workflow:
-        raise RuntimeError(
-            "Unable to find rust-release workflow for version "
-            f"{version} in {GITHUB_REPO} (branch {release_branch}, workflow {WORKFLOW_NAME})."
-        )
-    return workflow
 
 
 def resolve_workflow_url(version: str, override: str | None) -> tuple[str, str | None]:

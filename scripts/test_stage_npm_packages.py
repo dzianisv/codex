@@ -15,13 +15,14 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ResolveReleaseWorkflowTests(unittest.TestCase):
-    def test_queries_upstream_repo_for_release_workflow(self) -> None:
+    def test_queries_detected_repo_for_release_workflow(self) -> None:
+        repo = "dzianisv/codex"
         expected = {
             "workflowName": "rust-release",
-            "url": "https://github.com/openai/codex/actions/runs/20345806534",
+            "url": f"https://github.com/{repo}/actions/runs/20345806534",
             "headSha": "5b9d9a60d74c8ee2cb34d60fb14b71990e8318ea",
         }
-        with patch.object(
+        with patch.object(MODULE, "get_github_repo", return_value=repo), patch.object(
             MODULE.subprocess,
             "check_output",
             return_value=MODULE.json.dumps(expected),
@@ -31,17 +32,42 @@ class ResolveReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow, expected)
         cmd = check_output.call_args.args[0]
         self.assertEqual(cmd[:4], ["gh", "run", "list", "-R"])
-        self.assertEqual(cmd[4], MODULE.GITHUB_REPO)
+        self.assertEqual(cmd[4], repo)
         self.assertIn("--branch", cmd)
         self.assertEqual(cmd[cmd.index("--branch") + 1], "rust-v0.74.0")
         self.assertIn("--workflow", cmd)
         self.assertEqual(cmd[cmd.index("--workflow") + 1], MODULE.WORKFLOW_NAME)
 
-    def test_missing_workflow_error_mentions_repo_and_branch(self) -> None:
-        with patch.object(MODULE.subprocess, "check_output", return_value=""):
+    def test_falls_back_to_upstream_when_current_repo_has_no_workflow(self) -> None:
+        repo = "dzianisv/codex"
+        expected = {
+            "workflowName": "rust-release",
+            "url": "https://github.com/openai/codex/actions/runs/20345806534",
+            "headSha": "5b9d9a60d74c8ee2cb34d60fb14b71990e8318ea",
+        }
+        with patch.object(MODULE, "get_github_repo", return_value=repo), patch.object(
+            MODULE.subprocess,
+            "check_output",
+            side_effect=["", MODULE.json.dumps(expected)],
+        ) as check_output:
+            workflow = MODULE.resolve_release_workflow("0.74.0")
+
+        self.assertEqual(workflow, expected)
+        first_cmd = check_output.call_args_list[0].args[0]
+        second_cmd = check_output.call_args_list[1].args[0]
+        self.assertEqual(first_cmd[4], repo)
+        self.assertEqual(second_cmd[4], MODULE.DEFAULT_GITHUB_REPO)
+
+    def test_missing_workflow_error_mentions_candidate_repos_and_branch(self) -> None:
+        repo = "dzianisv/codex"
+        with patch.object(MODULE, "get_github_repo", return_value=repo), patch.object(
+            MODULE.subprocess,
+            "check_output",
+            return_value="",
+        ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                r"openai/codex.*rust-v0\.74\.0.*\.github/workflows/rust-release\.yml",
+                r"dzianisv/codex, openai/codex.*rust-v0\.74\.0.*\.github/workflows/rust-release\.yml",
             ):
                 MODULE.resolve_release_workflow("0.74.0")
 

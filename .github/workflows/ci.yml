@@ -36,8 +36,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Use a rust-release version that includes all native binaries.
-          CODEX_VERSION=0.74.0
+          # Discover a live rust-release run instead of pinning an expired artifact set.
+          CODEX_VERSION=$(gh run list \
+            -R openai/codex \
+            --workflow .github/workflows/rust-release.yml \
+            --json headBranch,status,conclusion \
+            --jq 'map(select(.status == "completed" and .conclusion == "success" and (.headBranch | startswith("rust-v"))))[0].headBranch | sub("^rust-v"; "")')
+          if [ -z "$CODEX_VERSION" ] || [ "$CODEX_VERSION" = "null" ]; then
+            echo "Unable to resolve a live rust-release version" >&2
+            exit 1
+          fi
           OUTPUT_DIR="${RUNNER_TEMP}"
           python3 ./scripts/stage_npm_packages.py \
             --release-version "$CODEX_VERSION" \
