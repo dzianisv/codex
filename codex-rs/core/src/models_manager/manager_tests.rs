@@ -5,6 +5,7 @@ use crate::config::ConfigBuilder;
 use crate::model_provider_info::WireApi;
 use chrono::Utc;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -824,6 +825,88 @@ async fn models_dev_provider_match_uses_base_url_host_when_name_is_custom() {
             .iter()
             .any(|preset| preset.model == "claude-host-match"),
         "expected provider host fallback to match models.dev provider"
+    );
+}
+
+#[tokio::test]
+async fn models_dev_provider_alias_model_inherits_canonical_reasoning_metadata() {
+    let models_dev_server = MockServer::start().await;
+    let _models_dev = wiremock::Mock::given(method("GET"))
+        .and(path("/api.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "azure": {
+                "id": "azure",
+                "name": "Azure",
+                "api": "https://azure.example.com/openai",
+                "env": ["AZURE_OPENAI_API_KEY"],
+                "models": {
+                    "azure/gpt-5.4-pro": {
+                        "id": "azure/gpt-5.4-pro",
+                        "name": "Azure GPT 5.4 Pro",
+                        "release_date": "2026-01-01",
+                        "attachment": false,
+                        "reasoning": true,
+                        "temperature": true,
+                        "tool_call": true,
+                        "limit": {"context": 128000, "output": 4096},
+                        "options": {}
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount_as_scoped(&models_dev_server)
+        .await;
+
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("unused"));
+    let provider = ModelProviderInfo {
+        name: "Azure OpenAI".to_string(),
+        base_url: Some("https://azure.example.com/openai".to_string()),
+        env_key: Some("AZURE_OPENAI_API_KEY".to_string()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: Some(
+            [("api-version".to_string(), "2025-04-01-preview".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+    let manager = ModelsManager::with_provider_and_models_dev_url_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+        format!("{}/api.json", models_dev_server.uri()),
+    );
+
+    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+    let preset = available
+        .iter()
+        .find(|preset| preset.model == "azure/gpt-5.4-pro")
+        .expect("expected Azure alias model to be listed");
+
+    assert_eq!(preset.default_reasoning_effort, ReasoningEffort::Medium);
+    assert_eq!(
+        preset
+            .supported_reasoning_efforts
+            .iter()
+            .map(|preset| preset.effort)
+            .collect::<Vec<_>>(),
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ]
     );
 }
 
