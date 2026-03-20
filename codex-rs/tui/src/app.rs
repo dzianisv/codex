@@ -30,7 +30,6 @@ use crate::model_migration::run_model_migration_prompt;
 use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
-use crate::multi_agents::sort_agent_picker_threads;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -49,6 +48,8 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
+#[cfg(test)]
+use codex_core::config::types::ApprovalsReviewer;
 use codex_core::config::types::ModelAvailabilityNuxConfig;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::Feature;
@@ -90,6 +91,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
@@ -983,16 +985,14 @@ impl App {
         updated_config.model = Some(model.to_string());
         updated_config.model_reasoning_effort = effort;
         let replacement_server = Arc::new(ThreadManager::new(
-            updated_config.codex_home.clone(),
+            &updated_config,
             self.auth_manager.clone(),
             SessionSource::Cli,
-            updated_config.model_catalog.clone(),
             CollaborationModesConfig {
                 default_mode_request_user_input: updated_config
                     .features
                     .enabled(Feature::DefaultModeRequestUserInput),
             },
-            updated_config.model_provider.clone(),
         ));
         replacement_server
             .plugins_manager()
@@ -1011,13 +1011,21 @@ impl App {
                     updated_config.clone(),
                     rollout_path.clone(),
                     self.auth_manager.clone(),
+                    None,
                 )
                 .await
             {
                 Ok(resumed) => {
                     self.shutdown_current_thread().await;
-                    if let Err(err) = previous_server.remove_and_close_all_threads().await {
-                        tracing::warn!(error = %err, "failed to close previous threads");
+                    let report = previous_server
+                        .shutdown_all_threads_bounded(Duration::from_secs(5))
+                        .await;
+                    if !report.submit_failed.is_empty() || !report.timed_out.is_empty() {
+                        tracing::warn!(
+                            submit_failed = report.submit_failed.len(),
+                            timed_out = report.timed_out.len(),
+                            "failed to close previous threads"
+                        );
                     }
                     self.server = replacement_server;
                     self.config = updated_config;
@@ -1046,8 +1054,15 @@ impl App {
         }
 
         self.shutdown_current_thread().await;
-        if let Err(err) = previous_server.remove_and_close_all_threads().await {
-            tracing::warn!(error = %err, "failed to close previous threads");
+        let report = previous_server
+            .shutdown_all_threads_bounded(Duration::from_secs(5))
+            .await;
+        if !report.submit_failed.is_empty() || !report.timed_out.is_empty() {
+            tracing::warn!(
+                submit_failed = report.submit_failed.len(),
+                timed_out = report.timed_out.len(),
+                "failed to close previous threads"
+            );
         }
         self.server = replacement_server;
         self.config = updated_config;
@@ -1173,8 +1188,10 @@ impl App {
         history_cell::SessionHeaderHistoryCell::new(
             self.chat_widget.current_model().to_string(),
             self.chat_widget.current_reasoning_effort(),
-            self.chat_widget
-                .should_show_fast_status(self.chat_widget.current_service_tier()),
+            self.chat_widget.should_show_fast_status(
+                self.chat_widget.current_model(),
+                self.chat_widget.current_service_tier(),
+            ),
             self.config.cwd.clone(),
             version,
         )
@@ -1628,7 +1645,34 @@ impl App {
             .iter()
             .map(|(thread_id, entry)| (*thread_id, entry.clone()))
             .collect();
-        sort_agent_picker_threads(&mut agent_threads);
+        let primary_thread_id = self.primary_thread_id;
+        agent_threads.sort_by(|(left_id, left_entry), (right_id, right_entry)| {
+            let left_is_primary = primary_thread_id == Some(*left_id);
+            let right_is_primary = primary_thread_id == Some(*right_id);
+            let left_name = format_agent_picker_item_name(
+                left_entry.agent_nickname.as_deref(),
+                left_entry.agent_role.as_deref(),
+                left_is_primary,
+            );
+            let right_name = format_agent_picker_item_name(
+                right_entry.agent_nickname.as_deref(),
+                right_entry.agent_role.as_deref(),
+                right_is_primary,
+            );
+            (
+                left_is_primary,
+                !left_entry.is_closed,
+                left_name,
+                left_id.to_string(),
+            )
+                .cmp(&(
+                    right_is_primary,
+                    !right_entry.is_closed,
+                    right_name,
+                    right_id.to_string(),
+                ))
+                .reverse()
+        });
 
         let mut initial_selected_idx = None;
         let items: Vec<SelectionItem> = agent_threads
@@ -1791,8 +1835,16 @@ impl App {
             self.chat_widget.thread_name(),
         );
         self.shutdown_current_thread().await;
-        if let Err(err) = self.server.remove_and_close_all_threads().await {
-            tracing::warn!(error = %err, "failed to close all threads");
+        let report = self
+            .server
+            .shutdown_all_threads_bounded(Duration::from_secs(5))
+            .await;
+        if !report.submit_failed.is_empty() || !report.timed_out.is_empty() {
+            tracing::warn!(
+                submit_failed = report.submit_failed.len(),
+                timed_out = report.timed_out.len(),
+                "failed to close all threads"
+            );
         }
         let init = crate::chatwidget::ChatWidgetInit {
             config,
@@ -1954,16 +2006,14 @@ impl App {
         let harness_overrides =
             normalize_harness_overrides_for_cwd(harness_overrides, &config.cwd)?;
         let thread_manager = Arc::new(ThreadManager::new(
-            config.codex_home.clone(),
+            &config,
             auth_manager.clone(),
             SessionSource::Cli,
-            config.model_catalog.clone(),
             CollaborationModesConfig {
                 default_mode_request_user_input: config
                     .features
                     .enabled(codex_core::features::Feature::DefaultModeRequestUserInput),
             },
-            config.model_provider.clone(),
         ));
         // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
         thread_manager
@@ -2067,6 +2117,7 @@ impl App {
                         config.clone(),
                         target_session.path.clone(),
                         auth_manager.clone(),
+                        None,
                     )
                     .await
                     .wrap_err_with(|| {
@@ -2104,6 +2155,7 @@ impl App {
                         config.clone(),
                         target_session.path.clone(),
                         false,
+                        None,
                     )
                     .await
                     .wrap_err_with(|| {
@@ -2415,6 +2467,7 @@ impl App {
                                 resume_config.clone(),
                                 target_session.path.clone(),
                                 self.auth_manager.clone(),
+                                None,
                             )
                             .await
                         {
@@ -2483,7 +2536,7 @@ impl App {
                     if path.exists() {
                         match self
                             .server
-                            .fork_thread(usize::MAX, self.config.clone(), path.clone(), false)
+                            .fork_thread(usize::MAX, self.config.clone(), path.clone(), false, None)
                             .await
                         {
                             Ok(forked) => {
@@ -2644,6 +2697,9 @@ impl App {
                         url,
                         is_installed,
                         is_enabled,
+                        suggest_reason: None,
+                        suggestion_type: None,
+                        elicitation_target: None,
                     });
             }
             AppEvent::OpenUrlInBrowser { url } => {
@@ -3331,6 +3387,36 @@ impl App {
                     }
                 }
             }
+            AppEvent::UpdateApprovalsReviewer(policy) => {
+                self.config.approvals_reviewer = policy;
+                self.chat_widget.set_approvals_reviewer(policy);
+                let profile = self.active_profile.as_deref();
+                let segments = if let Some(profile) = profile {
+                    vec![
+                        "profiles".to_string(),
+                        profile.to_string(),
+                        "approvals_reviewer".to_string(),
+                    ]
+                } else {
+                    vec!["approvals_reviewer".to_string()]
+                };
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .with_edits([ConfigEdit::SetPath {
+                        segments,
+                        value: policy.to_string().into(),
+                    }])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist approvals reviewer update"
+                    );
+                    self.chat_widget
+                        .add_error_message(format!("Failed to save approvals reviewer: {err}"));
+                }
+            }
             AppEvent::UpdateFeatureFlags { updates } => {
                 self.update_feature_flags(updates).await;
             }
@@ -3597,11 +3683,11 @@ impl App {
                         lines.push(Line::from(""));
                     }
                     if let Some(rule_line) =
-                        crate::bottom_pane::format_additional_permissions_rule(&permissions)
+                        crate::bottom_pane::format_requested_permissions_rule(&permissions)
                     {
                         lines.push(Line::from(vec![
                             "Permission rule: ".into(),
-                            rule_line.cyan(),
+                            Span::from(rule_line).cyan(),
                         ]));
                     }
                     self.overlay = Some(Overlay::new_static_with_renderables(
@@ -3831,6 +3917,7 @@ impl App {
                 model_provider_id: config_snapshot.model_provider_id,
                 service_tier: config_snapshot.service_tier,
                 approval_policy: config_snapshot.approval_policy,
+                approvals_reviewer: config_snapshot.approvals_reviewer,
                 sandbox_policy: config_snapshot.sandbox_policy,
                 cwd: config_snapshot.cwd,
                 reasoning_effort: config_snapshot.reasoning_effort,
@@ -4320,6 +4407,7 @@ mod tests {
                 request_max_retries: None,
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
+                websocket_connect_timeout_ms: None,
                 requires_openai_auth: false,
                 supports_websockets: false,
             },
@@ -4524,6 +4612,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -4696,6 +4785,7 @@ mod tests {
                         model_provider_id: "test-provider".to_string(),
                         service_tier: None,
                         approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
                         sandbox_policy: SandboxPolicy::new_read_only_policy(),
                         cwd: PathBuf::from("/tmp/project"),
                         reasoning_effort: None,
@@ -4773,6 +4863,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -4854,6 +4945,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -4934,6 +5026,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -5008,6 +5101,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -5121,6 +5215,7 @@ mod tests {
                         model_provider_id: "test-provider".to_string(),
                         service_tier: None,
                         approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
                         sandbox_policy: SandboxPolicy::new_read_only_policy(),
                         cwd: PathBuf::from("/tmp/project"),
                         reasoning_effort: None,
@@ -5190,6 +5285,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -5293,6 +5389,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -5369,6 +5466,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,
@@ -5814,6 +5912,7 @@ mod tests {
                         model_provider_id: "test-provider".to_string(),
                         service_tier: None,
                         approval_policy: AskForApproval::OnRequest,
+                        approvals_reviewer: ApprovalsReviewer::User,
                         sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
                         cwd: PathBuf::from("/tmp/agent"),
                         reasoning_effort: None,
@@ -6036,6 +6135,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
@@ -6693,6 +6793,7 @@ mod tests {
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: next_cwd.clone(),
                 reasoning_effort: None,
@@ -6811,7 +6912,7 @@ model = "gpt-5.4"
 
         assert!(matches!(control, AppRunControl::Continue));
         assert_eq!(app.config.model_provider_id, "github-copilot");
-        assert_eq!(app.config.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(app.config.model.as_deref(), Some("claude-4.6-opus"));
         assert_eq!(
             app.chat_widget.config_ref().model_provider_id,
             "github-copilot"
@@ -6891,6 +6992,7 @@ model = "gpt-5.4"
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: None,
@@ -6950,6 +7052,7 @@ model = "gpt-5.4"
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: None,
@@ -7042,6 +7145,7 @@ model = "gpt-5.4"
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: None,
@@ -7107,6 +7211,7 @@ model = "gpt-5.4"
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: None,
@@ -7187,6 +7292,7 @@ model = "gpt-5.4"
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: None,
@@ -7314,6 +7420,7 @@ model = "gpt-5.4"
             model_provider_id: "test-provider".to_string(),
             service_tier: None,
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: PathBuf::from("/home/user/project"),
             reasoning_effort: None,
@@ -7383,6 +7490,7 @@ model = "gpt-5.4"
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/tmp/project"),
                 reasoning_effort: None,

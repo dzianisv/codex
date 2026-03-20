@@ -2085,11 +2085,7 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
         Ok(requests)
     });
 
-    Ok((
-        provider_api.clone(),
-        format!("http://{address}/api.json"),
-        handle,
-    ))
+    Ok((provider_api, format!("http://{address}/api.json"), handle))
 }
 
 async fn type_text_with_stabilization(writer: &tokio::sync::mpsc::Sender<Vec<u8>>, text: &str) {

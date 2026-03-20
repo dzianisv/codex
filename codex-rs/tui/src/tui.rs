@@ -544,3 +544,14 @@ impl Tui {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use ratatui::backend::CrosstermBackend;
+
+    pub(crate) fn create_test_tui() -> Result<Tui> {
+        let terminal = custom_terminal::Terminal::with_options(CrosstermBackend::new(stdout()))?;
+        Ok(Tui::new(terminal))
+    }
+}

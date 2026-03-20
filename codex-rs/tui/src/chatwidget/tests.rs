@@ -8393,18 +8393,16 @@ async fn model_picker_switches_from_gpt5_3_to_copilot_claude_with_runtime_switch
         "expected persisted Copilot Claude model selection; events: {switch_events:?}"
     );
     assert!(
-        switch_events
-            .iter()
-            .any(|event| matches!(event, AppEvent::UpdateModel(model) if model == "claude-opus-4.6")),
+        switch_events.iter().any(
+            |event| matches!(event, AppEvent::UpdateModel(model) if model == "claude-opus-4.6")
+        ),
         "expected in-session model update for provider switch; events: {switch_events:?}"
     );
     assert!(
-        switch_events
-            .iter()
-            .any(|event| matches!(
-                event,
-                AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Medium))
-            )),
+        switch_events.iter().any(|event| matches!(
+            event,
+            AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Medium))
+        )),
         "expected in-session reasoning update for provider switch; events: {switch_events:?}"
     );
 }

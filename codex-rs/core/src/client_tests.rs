@@ -1,8 +1,8 @@
 use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
-use super::synthesize_chat_completions_output_items;
 use super::UnauthorizedRecoveryExecution;
+use super::synthesize_chat_completions_output_items;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputBody;
