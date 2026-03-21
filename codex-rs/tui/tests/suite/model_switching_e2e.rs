@@ -908,6 +908,180 @@ async fn cross_provider_model_switch_applies_immediately_without_manual_new_sess
     Ok(())
 }
 
+#[tokio::test]
+async fn cross_provider_model_switch_then_enable_reflection_runs_judge_in_same_session()
+-> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let Some(codex_cli) = find_codex_cli(&repo_root) else {
+        eprintln!("skipping integration test because codex binary is unavailable");
+        return Ok(());
+    };
+
+    let startup_model = "azure-model-a";
+    let selected_model = "claude-4.6-opus";
+    let prompt = "Confirm the active provider after the switch.";
+    let azure_answer = "Azure should not handle the post-switch prompt.";
+    let copilot_answer = "Copilot provider handled the prompt immediately.";
+    let reflection_verdict = r#"{"completed":true,"confidence":0.97,"reasoning":"The prompt was answered after the provider switch.","feedback":null}"#;
+
+    let (azure_base_url, azure_server) = spawn_openai_compat_models_and_responses_server(
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": startup_model, "object": "model"},
+                {"id": "azure-model-b", "object": "model"}
+            ]
+        }),
+        startup_model,
+        azure_answer,
+    )?;
+    let (copilot_base_url, copilot_server) = spawn_openai_compat_models_and_reflection_server(
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": selected_model, "object": "model"}
+            ]
+        }),
+        selected_model,
+        copilot_answer,
+        reflection_verdict,
+    )?;
+    let (models_dev_url, models_dev_server) = spawn_models_dev_catalog_server(serde_json::json!({
+        "azure": {
+            "id": "azure",
+            "name": "Azure",
+            "api": azure_base_url.clone(),
+            "models": {
+                startup_model: {"id": startup_model, "name": startup_model},
+                "azure-model-b": {"id": "azure-model-b", "name": "azure-model-b"}
+            }
+        },
+        "github-copilot": {
+            "id": "github-copilot",
+            "name": "GitHub Copilot",
+            "api": copilot_base_url.clone(),
+            "models": {
+                selected_model: {"id": selected_model, "name": selected_model}
+            }
+        },
+        "ollama": {
+            "id": "ollama",
+            "name": "Ollama",
+            "api": "http://127.0.0.1:11434/v1",
+            "models": {
+                "llama3.2:latest": {"id": "llama3.2:latest", "name": "llama3.2:latest"}
+            }
+        },
+        "lmstudio": {
+            "id": "lmstudio",
+            "name": "LM Studio",
+            "api": "http://127.0.0.1:1234/v1",
+            "models": {
+                "qwen2.5-coder:7b": {"id": "qwen2.5-coder:7b", "name": "qwen2.5-coder:7b"}
+            }
+        }
+    }))?;
+    let codex_home = tempdir_with_dual_provider_config(
+        &repo_root,
+        startup_model,
+        azure_base_url.as_str(),
+        copilot_base_url.as_str(),
+    )?;
+
+    let mut env = HashMap::new();
+    env.insert("AZURE_TEST_KEY".to_string(), "test-azure-token".to_string());
+    env.insert(
+        "GITHUB_COPILOT_TOKEN".to_string(),
+        "test-copilot-token".to_string(),
+    );
+    env.insert("CODEX_MODELS_DEV_URL".to_string(), models_dev_url);
+
+    let output = run_codex_cli_with_filter_and_reflection(
+        &codex_cli,
+        codex_home.path(),
+        &repo_root,
+        startup_model,
+        selected_model,
+        Some(prompt),
+        env,
+    )
+    .await
+    .context(
+        "cross-provider switch plus /experimental reflection should apply immediately in-session",
+    )?;
+
+    let azure_requests = azure_server
+        .join()
+        .expect("azure test server should join")?;
+    let copilot_requests = copilot_server
+        .join()
+        .expect("copilot reflection test server should join")?;
+    let models_dev_requests = models_dev_server
+        .join()
+        .expect("models.dev server should join")?;
+
+    anyhow::ensure!(
+        models_dev_requests
+            .iter()
+            .any(|request| request.starts_with("GET /api.json ")),
+        "expected GET /api.json request; got requests: {models_dev_requests:?}"
+    );
+
+    assert_model_and_provider_in_config(
+        codex_home.path(),
+        selected_model,
+        "github-copilot",
+        &output,
+    )?;
+    assert_reflection_enabled_in_config(codex_home.path(), &output)?;
+
+    anyhow::ensure!(
+        output.contains(copilot_answer),
+        "expected Copilot answer in PTY output after switch; output: {output}"
+    );
+    anyhow::ensure!(
+        output.contains("Reflection: Task completed"),
+        "expected reflection verdict in PTY output; output: {output}"
+    );
+
+    let copilot_responses_requests = copilot_requests
+        .iter()
+        .filter(|request| request.starts_with("POST /v1/responses "))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        copilot_responses_requests.len() >= 2,
+        "expected prompt + reflection judge /responses requests after switch; got requests: {copilot_requests:?}"
+    );
+    anyhow::ensure!(
+        copilot_responses_requests[0].contains(format!("\"model\":\"{selected_model}\"").as_str()),
+        "expected selected model in first Copilot /responses request body; request: {}",
+        copilot_responses_requests[0]
+    );
+    anyhow::ensure!(
+        copilot_responses_requests[0].contains(prompt),
+        "expected prompt text in first Copilot /responses request body; request: {}",
+        copilot_responses_requests[0]
+    );
+    anyhow::ensure!(
+        copilot_responses_requests[1].contains("task verification judge")
+            || copilot_responses_requests[1].contains("ORIGINAL TASK"),
+        "expected reflection judge prompt in second Copilot /responses request body; request: {}",
+        copilot_responses_requests[1]
+    );
+    anyhow::ensure!(
+        !azure_requests
+            .iter()
+            .any(|request| request.starts_with("POST /v1/responses ")),
+        "did not expect post-switch /responses requests against Azure provider; requests: {azure_requests:?}"
+    );
+
+    Ok(())
+}
+
 fn tempdir_with_ollama_config(repo_root: &Path, model: &str) -> Result<TempDir> {
     let codex_home = tempfile::tempdir()?;
 
@@ -1255,6 +1429,36 @@ fn model_from_template(
     Ok(JsonValue::Object(model))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExperimentalInteraction {
+    None,
+    EnableReflection,
+}
+
+async fn run_codex_cli_with_filter_and_reflection(
+    codex_cli: &Path,
+    codex_home: &Path,
+    cwd: &Path,
+    startup_model_hint: &str,
+    filter: &str,
+    prompt_after_switch: Option<&str>,
+    extra_env: HashMap<String, String>,
+) -> Result<String> {
+    run_codex_cli_with_filter_options(
+        codex_cli,
+        codex_home,
+        cwd,
+        startup_model_hint,
+        filter,
+        None,
+        prompt_after_switch,
+        extra_env,
+        ExperimentalInteraction::EnableReflection,
+        true,
+    )
+    .await
+}
+
 async fn run_codex_cli_with_filter(
     codex_cli: &Path,
     codex_home: &Path,
@@ -1273,6 +1477,7 @@ async fn run_codex_cli_with_filter(
         None,
         prompt_after_switch,
         extra_env,
+        ExperimentalInteraction::None,
         true,
     )
     .await
@@ -1297,6 +1502,7 @@ async fn run_codex_cli_with_filter_and_reasoning(
         reasoning_filter,
         prompt_after_switch,
         extra_env,
+        ExperimentalInteraction::None,
         true,
     )
     .await
@@ -1311,6 +1517,7 @@ async fn run_codex_cli_with_filter_options(
     reasoning_filter: Option<&str>,
     prompt_after_switch: Option<&str>,
     extra_env: HashMap<String, String>,
+    experimental_interaction: ExperimentalInteraction,
     send_escape_before_prompt: bool,
 ) -> Result<String> {
     let mut env = HashMap::new();
@@ -1414,6 +1621,18 @@ async fn run_codex_cli_with_filter_options(
                 }
             }
             let _ = writer_for_input.send(vec![b'\r']).await;
+        }
+        if experimental_interaction == ExperimentalInteraction::EnableReflection {
+            sleep(Duration::from_millis(900)).await;
+            type_text_with_stabilization(&writer_for_input, "/experimental").await;
+            sleep(Duration::from_millis(120)).await;
+            let _ = writer_for_input.send(vec![13]).await;
+            sleep(Duration::from_millis(900)).await;
+            let _ = writer_for_input.send(vec![0x1b, b'[', b'B']).await;
+            sleep(Duration::from_millis(120)).await;
+            let _ = writer_for_input.send(vec![b' ']).await;
+            sleep(Duration::from_millis(120)).await;
+            let _ = writer_for_input.send(vec![13]).await;
         }
         if let Some(prompt) = prompt_after_switch {
             // Allow model/effort selection to settle before prompt input.
@@ -1564,6 +1783,171 @@ fn debug_target_binary(repo_root: &Path, binary: &str) -> PathBuf {
         .join("target")
         .join("debug")
         .join(format!("{binary}{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn spawn_openai_compat_models_and_reflection_server(
+    models_response_json: serde_json::Value,
+    response_model: &str,
+    answer_text: &str,
+    reflection_verdict_json: &str,
+) -> Result<(String, thread::JoinHandle<Result<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let models_response_body = models_response_json.to_string();
+    let response_model_json = serde_json::to_string(response_model)?;
+    let answer_json = serde_json::to_string(answer_text)?;
+    let reflection_verdict_json = serde_json::to_string(reflection_verdict_json)?;
+    let assistant_sse = format!(
+        r#"event: response.created
+data: {{"type":"response.created","response":{{"id":"resp-1","model":{response_model_json}}}}}
+
+event: response.output_item.done
+data: {{"type":"response.output_item.done","item":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":{answer_json}}}]}}}}
+
+event: response.completed
+data: {{"type":"response.completed","response":{{"id":"resp-1","usage":{{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}}}}
+
+"#
+    );
+    let reflection_sse = format!(
+        r#"event: response.created
+data: {{"type":"response.created","response":{{"id":"resp-2","model":{response_model_json}}}}}
+
+event: response.output_item.done
+data: {{"type":"response.output_item.done","item":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":{reflection_verdict_json}}}]}}}}
+
+event: response.completed
+data: {{"type":"response.completed","response":{{"id":"resp-2","usage":{{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}}}}
+
+"#
+    );
+    let handle = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .context("failed to set nonblocking listener")?;
+        let mut requests = Vec::new();
+        let mut responses_requests = 0usize;
+        let hard_deadline = Instant::now() + Duration::from_secs(30);
+        let mut idle_deadline: Option<Instant> = None;
+        while Instant::now() < hard_deadline
+            && idle_deadline
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(true)
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .context("failed to set read timeout")?;
+
+                    let mut raw_request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                raw_request.extend_from_slice(&chunk[..bytes_read]);
+                                if raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    if raw_request.is_empty() {
+                        continue;
+                    }
+
+                    let Some(header_end) = raw_request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_string();
+                    let Some(request_line) = headers.lines().next() else {
+                        continue;
+                    };
+                    let request_line = request_line.to_string();
+
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let lower = line.to_ascii_lowercase();
+                            lower
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+
+                    let mut body_bytes = raw_request[header_end..].to_vec();
+                    while body_bytes.len() < content_length {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => body_bytes.extend_from_slice(&chunk[..bytes_read]),
+                            Err(err)
+                                if err.kind() == std::io::ErrorKind::WouldBlock
+                                    || err.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+
+                    let body = String::from_utf8_lossy(&body_bytes).to_string();
+                    requests.push(format!("{request_line}\n{body}"));
+
+                    let response = if is_models_endpoint_request(&request_line) {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            models_response_body.len(),
+                            models_response_body
+                        )
+                    } else if request_line.starts_with("POST /v1/responses ") {
+                        responses_requests += 1;
+                        let sse = if responses_requests == 1 {
+                            &assistant_sse
+                        } else {
+                            &reflection_sse
+                        };
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            sse.len(),
+                            sse
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+
+                    stream
+                        .write_all(response.as_bytes())
+                        .context("failed to write test server response")?;
+                    stream
+                        .flush()
+                        .context("failed to flush test server response")?;
+
+                    idle_deadline = Some(Instant::now() + Duration::from_secs(20));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(requests)
+    });
+
+    Ok((format!("http://{address}/v1"), handle))
 }
 
 fn spawn_openai_compat_models_and_responses_server(
@@ -2128,6 +2512,33 @@ fn assert_model_and_provider_in_config(
     anyhow::ensure!(
         actual_provider == expected_provider,
         "expected provider={expected_provider}, got {actual_provider}; config: {config}"
+    );
+    Ok(())
+}
+
+fn assert_reflection_enabled_in_config(codex_home: &Path, output: &str) -> Result<()> {
+    let config = std::fs::read_to_string(codex_home.join("config.toml"))?;
+    let parsed: toml::Value = toml::from_str(&config)?;
+    let reflection_enabled = parsed
+        .get("reflection")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        .context("missing reflection.enabled in config.toml")?;
+    let feature_enabled = parsed
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("reflection"))
+        .and_then(toml::Value::as_bool)
+        .context("missing features.reflection in config.toml")?;
+
+    anyhow::ensure!(
+        reflection_enabled,
+        "expected reflection.enabled=true after /experimental; config: {config}; output: {output}"
+    );
+    anyhow::ensure!(
+        feature_enabled,
+        "expected features.reflection=true after /experimental; config: {config}; output: {output}"
     );
     Ok(())
 }

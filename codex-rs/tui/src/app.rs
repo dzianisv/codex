@@ -1101,6 +1101,9 @@ impl App {
                 Feature::WindowsSandbox | Feature::WindowsSandboxElevated
             )
         });
+        let reflection_changed = updates
+            .iter()
+            .any(|(feature, _)| *feature == Feature::Reflection);
         let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
             .with_profile(self.active_profile.as_deref());
 
@@ -1166,6 +1169,8 @@ impl App {
             tracing::error!(error = %err, "failed to persist feature flags");
             self.chat_widget
                 .add_error_message(format!("Failed to update experimental features: {err}"));
+        } else if reflection_changed {
+            self.chat_widget.submit_op(Op::ReloadUserConfig);
         }
     }
 
@@ -5748,14 +5753,48 @@ mod tests {
         );
         assert!(!app.config.reflection.enabled);
         assert!(!app.chat_widget.config_ref().reflection.enabled);
+        assert_matches!(op_rx.try_recv(), Ok(Op::ReloadUserConfig));
         assert!(
             op_rx.try_recv().is_err(),
-            "feature toggle should not patch the active session"
+            "expected only ReloadUserConfig op"
         );
 
         let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
         assert!(config.contains("[reflection]"));
         assert!(config.contains("enabled = false"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_feature_flags_enabling_reflection_reloads_user_config_for_active_session()
+    -> Result<()> {
+        let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+
+        app.update_feature_flags(vec![(Feature::Reflection, true)])
+            .await;
+
+        assert!(app.config.features.enabled(Feature::Reflection));
+        assert!(app.config.reflection.enabled);
+        assert!(
+            app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::Reflection)
+        );
+        assert!(app.chat_widget.config_ref().reflection.enabled);
+        assert_matches!(op_rx.try_recv(), Ok(Op::ReloadUserConfig));
+        assert!(
+            op_rx.try_recv().is_err(),
+            "expected only ReloadUserConfig op"
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(config.contains("[features]"));
+        assert!(config.contains("reflection = true"));
+        assert!(config.contains("[reflection]"));
+        assert!(config.contains("enabled = true"));
         Ok(())
     }
 

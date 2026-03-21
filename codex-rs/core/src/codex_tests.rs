@@ -8,6 +8,7 @@ use crate::config_loader::NetworkConstraints;
 use crate::config_loader::RequirementSource;
 use crate::config_loader::Sourced;
 use crate::exec::ExecToolCallOutput;
+use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::mcp_connection_manager::ToolInfo;
 use crate::models_manager::model_info;
@@ -618,6 +619,26 @@ async fn reload_user_config_layer_updates_effective_apps_config() {
 
     assert!(!app.enabled);
     assert_eq!(app.destructive_enabled, Some(false));
+}
+
+#[tokio::test]
+async fn reload_user_config_layer_rebuilds_runtime_reflection_config() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let codex_home = session.codex_home().await;
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+    let config_toml_path = codex_home.join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &config_toml_path,
+        "[features]\nreflection = true\n\n[reflection]\nenabled = true\nmodel = \"gpt-5.4\"\n",
+    )
+    .expect("write user config");
+
+    session.reload_user_config_layer().await;
+
+    let config = session.get_config().await;
+    assert!(config.features.enabled(Feature::Reflection));
+    assert!(config.reflection.enabled);
+    assert_eq!(config.reflection.model.as_deref(), Some("gpt-5.4"));
 }
 
 #[test]

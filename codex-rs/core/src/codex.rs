@@ -163,10 +163,12 @@ use crate::client_common::ResponseEvent;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
+use crate::config::ConfigOverrides;
 use crate::config::Constrained;
 use crate::config::ConstraintResult;
 use crate::config::GhostSnapshotConfig;
 use crate::config::StartedNetworkProxy;
+use crate::config::deserialize_config_toml_with_base;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::config::types::McpServerConfig;
 use crate::config::types::ShellEnvironmentPolicy;
@@ -2457,6 +2459,30 @@ impl Session {
         state.session_configuration.provider.clone()
     }
 
+    fn reload_user_config_overrides(config: &Config) -> ConfigOverrides {
+        ConfigOverrides {
+            model: config.model.clone(),
+            review_model: config.review_model.clone(),
+            cwd: Some(config.cwd.clone()),
+            model_provider: Some(config.model_provider_id.clone()),
+            service_tier: Some(config.service_tier),
+            config_profile: config.active_profile.clone(),
+            codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
+            main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
+            js_repl_node_path: config.js_repl_node_path.clone(),
+            js_repl_node_module_dirs: Some(config.js_repl_node_module_dirs.clone()),
+            zsh_path: config.zsh_path.clone(),
+            base_instructions: config.base_instructions.clone(),
+            developer_instructions: config.developer_instructions.clone(),
+            personality: config.personality,
+            compact_prompt: config.compact_prompt.clone(),
+            include_apply_patch_tool: Some(config.include_apply_patch_tool),
+            show_raw_agent_reasoning: Some(config.show_raw_agent_reasoning),
+            ephemeral: Some(config.ephemeral),
+            ..Default::default()
+        }
+    }
+
     pub(crate) async fn reload_user_config_layer(&self) {
         let config_toml_path = {
             let state = self.state.lock().await;
@@ -2492,11 +2518,36 @@ impl Session {
         };
 
         let mut state = self.state.lock().await;
-        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-        config.config_layer_stack = config
+        let current_config = state
+            .session_configuration
+            .original_config_do_not_use
+            .clone();
+        let config_layer_stack = current_config
             .config_layer_stack
             .with_user_config(&config_toml_path, user_config);
-        state.session_configuration.original_config_do_not_use = Arc::new(config);
+        let merged_config = match deserialize_config_toml_with_base(
+            config_layer_stack.effective_config(),
+            &current_config.codex_home,
+        ) {
+            Ok(config) => config,
+            Err(err) => {
+                warn!("failed to deserialize reloaded config while reloading layer: {err}");
+                return;
+            }
+        };
+        let reloaded_config = match Config::load_config_with_layer_stack(
+            merged_config,
+            Self::reload_user_config_overrides(current_config.as_ref()),
+            current_config.codex_home.clone(),
+            config_layer_stack,
+        ) {
+            Ok(config) => config,
+            Err(err) => {
+                warn!("failed to rebuild config while reloading layer: {err}");
+                return;
+            }
+        };
+        state.session_configuration.original_config_do_not_use = Arc::new(reloaded_config);
         self.services.skills_manager.clear_cache();
         self.services.plugins_manager.clear_cache();
     }
