@@ -4526,7 +4526,7 @@ impl CodexMessageProcessor {
     }
 
     async fn mcp_server_refresh(&self, request_id: ConnectionRequestId, _params: Option<()>) {
-        if let Err(error) = self.load_latest_config(None).await {
+        if let Err(error) = self.load_latest_config(/*fallback_cwd*/ None).await {
             self.outgoing.send_error(request_id, error).await;
             return;
         }

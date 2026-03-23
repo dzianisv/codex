@@ -1164,7 +1164,7 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
 
 /// Save the default model provider to config.toml.
 pub fn set_default_model_provider(codex_home: &Path, provider: &str) -> std::io::Result<()> {
-    if !built_in_model_providers(None).contains_key(provider) {
+    if !built_in_model_providers(/*openai_base_url*/ None).contains_key(provider) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid model provider '{provider}'"),

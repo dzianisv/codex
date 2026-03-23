@@ -159,7 +159,7 @@ pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
 }
 
 pub fn is_default_test_model_catalog(model_catalog: &ModelsResponse) -> bool {
-    *model_catalog == build_test_model_catalog(None)
+    *model_catalog == build_test_model_catalog(/*existing*/ None)
 }
 
 fn load_bundled_models_response() -> anyhow::Result<ModelsResponse> {

@@ -212,7 +212,7 @@ impl ReflectionContext {
                     if tool_calls.len() < MAX_TOOL_CALLS {
                         tool_calls.push(ToolCallSummary {
                             tool_name: name.clone(),
-                            arguments: truncate_string(arguments, 200),
+                            arguments: truncate_string(arguments, /*max_len*/ 200),
                             result: String::new(),
                             success: true, // Default, will be updated when we see output
                         });
@@ -222,7 +222,7 @@ impl ReflectionContext {
                     // Update the last tool call with its result
                     if let Some(last_call) = tool_calls.last_mut() {
                         let output_text = output.to_string();
-                        last_call.result = truncate_string(&output_text, 500);
+                        last_call.result = truncate_string(&output_text, /*max_len*/ 500);
                         last_call.success = !output_indicates_error(&output_text);
                     }
                 }
@@ -278,7 +278,7 @@ impl ReflectionContext {
         let final_response_str = self
             .final_response
             .as_ref()
-            .map(|r| truncate_string(r, 1000))
+            .map(|r| truncate_string(r, /*max_len*/ 1000))
             .unwrap_or_else(|| "(No final response)".to_string());
 
         format!(
@@ -418,10 +418,10 @@ pub async fn evaluate_reflection(
             &prompt,
             model_info,
             session_telemetry,
-            None,
+            /*effort*/ None,
             ReasoningSummaryConfig::None,
-            None,
-            None,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
         )
         .await?;
     let mut response_text = String::new();
