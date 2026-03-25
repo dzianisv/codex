@@ -50,11 +50,25 @@ Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your 
 
 You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
+## Fork Enhancements
+
+This fork adds runtime model controls in the interactive CLI:
+
+- Run `/model` to switch provider and model without restarting Codex.
+- After selecting the model, choose the reasoning effort to use for that runtime configuration.
+- Provider-backed model catalogs are supported, so the picker can surface models exposed by configured integrations.
+
+This fork also includes an experimental reflection layer:
+
+- A judge model evaluates the completed turn, returns a verdict with confidence, and can trigger another attempt when the task is incomplete.
+- See [Reflection Layer](./docs/reflection.md) for configuration details, test coverage, and example output.
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
+- [**Reflection Layer**](./docs/reflection.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
