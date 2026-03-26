@@ -6487,7 +6487,7 @@ async fn run_sampling_request(
 
     let base_instructions = sess.get_base_instructions().await;
 
-    let prompt = build_prompt(
+    let mut prompt = build_prompt(
         input,
         router.as_ref(),
         turn_context.as_ref(),
@@ -6598,6 +6598,17 @@ async fn run_sampling_request(
                 .await;
             }
             tokio::time::sleep(delay).await;
+            // The failed attempt may have already recorded partial reasoning,
+            // calls, or tool outputs. Rebuild the prompt from live history so
+            // retries replay the same causal chain back to the model.
+            prompt = build_prompt(
+                sess.clone_history()
+                    .await
+                    .for_prompt(&turn_context.model_info.input_modalities),
+                router.as_ref(),
+                turn_context.as_ref(),
+                sess.get_base_instructions().await,
+            );
         } else {
             return Err(err);
         }
@@ -7431,6 +7442,10 @@ async fn try_run_sampling_request(
                 needs_follow_up |= output_result.needs_follow_up;
             }
             ResponseEvent::OutputItemAdded(item) => {
+                if matches!(item, ResponseItem::Reasoning { .. }) {
+                    sess.record_into_history(std::slice::from_ref(&item), turn_context.as_ref())
+                        .await;
+                }
                 if let Some(turn_item) = handle_non_tool_response_item(
                     sess.as_ref(),
                     turn_context.as_ref(),

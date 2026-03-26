@@ -101,6 +101,21 @@ fn reasoning_with_encrypted_content(len: usize) -> ResponseItem {
     }
 }
 
+fn reasoning_with_id(id: &str, summary: &str, raw_content: Option<&str>) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: id.to_string(),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText {
+            text: summary.to_string(),
+        }],
+        content: raw_content.map(|text| {
+            vec![ReasoningItemContent::ReasoningText {
+                text: text.to_string(),
+            }]
+        }),
+        encrypted_content: raw_content.map(|text| BASE64_STANDARD.encode(format!("padding{text}"))),
+    }
+}
+
 fn truncate_exec_output(content: &str) -> String {
     truncate::truncate_text(content, TruncationPolicy::Tokens(EXEC_FORMAT_MAX_TOKENS))
 }
@@ -165,6 +180,19 @@ fn filters_non_api_messages() {
             }
         ]
     );
+}
+
+#[test]
+fn record_items_replaces_reasoning_item_with_same_non_empty_id() {
+    let mut history = ContextManager::new();
+    let policy = TruncationPolicy::Tokens(10_000);
+    let partial = reasoning_with_id("reason-1", "partial", None);
+    let completed = reasoning_with_id("reason-1", "complete", Some("raw detail"));
+
+    history.record_items([&partial], policy);
+    history.record_items([&completed], policy);
+
+    assert_eq!(history.raw_items(), &[completed]);
 }
 
 #[test]

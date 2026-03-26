@@ -101,6 +101,17 @@ impl ContextManager {
             }
 
             let processed = self.process_item(item_ref, policy);
+            if let Some(reasoning_id) = reasoning_item_id(&processed)
+                && let Some(existing) = self
+                    .items
+                    .iter_mut()
+                    .rev()
+                    .find(|existing| reasoning_item_id(existing) == Some(reasoning_id))
+            {
+                *existing = processed;
+                continue;
+            }
+
             self.items.push(processed);
         }
     }
@@ -425,6 +436,13 @@ fn is_api_message(message: &ResponseItem) -> bool {
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::GhostSnapshot { .. } => false,
         ResponseItem::Other => false,
+    }
+}
+
+fn reasoning_item_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::Reasoning { id, .. } if !id.is_empty() => Some(id.as_str()),
+        _ => None,
     }
 }
 
