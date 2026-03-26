@@ -144,3 +144,79 @@ async fn retries_on_early_close() {
 
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_replayed_stream_request_when_stream_retries_are_disabled() {
+    skip_if_no_network!();
+
+    let incomplete_sse = sse_incomplete();
+    let completed_sse = responses::sse_completed("resp_ok");
+
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_sse.clone(),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_sse.clone(),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_sse,
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: completed_sse,
+        }],
+    ])
+    .await;
+
+    let model_provider = ModelProviderInfo {
+        name: "azure".into(),
+        base_url: Some(format!("{}/v1", server.uri())),
+        env_key: Some("PATH".into()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(3),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(2000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .unwrap();
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected repeated request replay after transient stream disconnects"
+    );
+
+    server.shutdown().await;
+}

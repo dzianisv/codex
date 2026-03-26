@@ -313,33 +313,50 @@ fn assistant_message_stream_parsers_can_be_seeded_from_output_item_added_text() 
 }
 
 #[test]
-fn effective_stream_retry_budget_allows_one_retry_for_transport_disconnect_when_disabled() {
+fn effective_stream_retry_budget_uses_request_retry_budget_for_transport_disconnects() {
     let err = CodexErr::Stream(
         "error sending request for url (https://example.com/v1/responses)".to_string(),
         None,
     );
 
-    assert_eq!(effective_stream_retry_budget(0, &err), 1);
+    assert_eq!(effective_stream_retry_budget(0, 4, &err), 4);
 }
 
 #[test]
-fn effective_stream_retry_budget_does_not_retry_once_for_non_transport_stream_error() {
+fn effective_stream_retry_budget_retries_incomplete_stream_disconnects() {
+    let err = CodexErr::Stream("stream closed before response.completed".to_string(), None);
+
+    assert_eq!(effective_stream_retry_budget(0, 4, &err), 4);
+}
+
+#[test]
+fn effective_stream_retry_budget_falls_back_to_one_retry_for_transport_disconnects() {
+    let err = CodexErr::Stream(
+        "error sending request for url (https://example.com/v1/responses)".to_string(),
+        None,
+    );
+
+    assert_eq!(effective_stream_retry_budget(0, 0, &err), 1);
+}
+
+#[test]
+fn effective_stream_retry_budget_does_not_retry_non_transport_stream_error() {
     let err = CodexErr::Stream(
         "Incomplete response returned, reason: content_filter".to_string(),
         None,
     );
 
-    assert_eq!(effective_stream_retry_budget(0, &err), 0);
+    assert_eq!(effective_stream_retry_budget(0, 4, &err), 0);
 }
 
 #[test]
-fn effective_stream_retry_budget_preserves_nonzero_configured_budget() {
+fn effective_stream_retry_budget_preserves_nonzero_stream_budget() {
     let err = CodexErr::Stream(
         "error sending request for url (https://example.com/v1/responses)".to_string(),
         None,
     );
 
-    assert_eq!(effective_stream_retry_budget(3, &err), 3);
+    assert_eq!(effective_stream_retry_budget(3, 9, &err), 3);
 }
 
 #[test]
