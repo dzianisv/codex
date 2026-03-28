@@ -6548,8 +6548,11 @@ async fn run_sampling_request(
         // Use the configured provider-specific stream retry budget, but still
         // allow one recovery attempt for transport disconnects when the
         // stream budget is explicitly set to zero.
-        let max_retries =
-            effective_stream_retry_budget(turn_context.provider.stream_max_retries(), &err);
+        let max_retries = effective_stream_retry_budget(
+            turn_context.provider.stream_max_retries(),
+            turn_context.provider.request_max_retries(),
+            &err,
+        );
         if retries >= max_retries
             && client_session.try_switch_fallback_transport(
                 &turn_context.session_telemetry,
@@ -6615,20 +6618,29 @@ async fn run_sampling_request(
     }
 }
 
-fn effective_stream_retry_budget(configured_max_retries: u64, err: &CodexErr) -> u64 {
-    if configured_max_retries == 0 && should_retry_once_on_transport_disconnect(err) {
-        1
-    } else {
-        configured_max_retries
+fn effective_stream_retry_budget(
+    configured_stream_max_retries: u64,
+    configured_request_max_retries: u64,
+    err: &CodexErr,
+) -> u64 {
+    if configured_stream_max_retries > 0 {
+        return configured_stream_max_retries;
     }
+    if !is_transient_transport_disconnect(err) {
+        return 0;
+    }
+    configured_request_max_retries.max(1)
 }
 
-fn should_retry_once_on_transport_disconnect(err: &CodexErr) -> bool {
+fn is_transient_transport_disconnect(err: &CodexErr) -> bool {
     match err {
-        CodexErr::Timeout | CodexErr::ConnectionFailed(_) => true,
+        CodexErr::Timeout | CodexErr::ConnectionFailed(_) | CodexErr::ResponseStreamFailed(_) => {
+            true
+        }
         CodexErr::Stream(message, _) => {
             message.contains("error sending request for url")
                 || message.contains("connection closed before message completed")
+                || message.contains("stream closed before response.completed")
                 || message.contains("connection reset")
         }
         _ => false,

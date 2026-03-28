@@ -3,8 +3,11 @@ use codex_core::auth::CODEX_API_KEY_ENV_VAR;
 use codex_protocol::protocol::GitInfo;
 use codex_utils_cargo_bin::find_resource;
 use core_test_support::fs_wait;
+use core_test_support::load_sse_fixture;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use serde_json::json;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -23,6 +26,12 @@ fn repo_root() -> std::path::PathBuf {
 fn cli_responses_fixture() -> std::path::PathBuf {
     #[expect(clippy::expect_used)]
     find_resource!("tests/cli_responses_fixture.sse").expect("failed to resolve fixture path")
+}
+
+fn incomplete_responses_sse() -> String {
+    let fixture = find_resource!("tests/fixtures/incomplete_sse.json")
+        .unwrap_or_else(|err| panic!("failed to resolve incomplete_sse fixture: {err}"));
+    load_sse_fixture(fixture)
 }
 
 /// Tests streaming the Responses API through the CLI using a mock server.
@@ -91,6 +100,74 @@ async fn responses_mode_stream_cli() {
     // );
     // assert!(page.items[0].thread_id.is_some(), "missing thread_id");
     // assert!(page.items[0].created_at.is_some(), "missing created_at");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_mode_stream_cli_retries_replayed_stream_request_when_stream_retries_disabled() {
+    skip_if_no_network!();
+
+    let server_responses = vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_responses_sse(),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_responses_sse(),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_responses_sse(),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "hi"),
+                responses::ev_completed("resp-1"),
+            ]),
+        }],
+    ];
+    let (server, _) = start_streaming_sse_server(server_responses).await;
+
+    let home = TempDir::new().unwrap();
+    let repo_root = repo_root();
+    let provider_override = format!(
+        "model_providers.mock={{ name = \"azure\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\", request_max_retries = 3, stream_max_retries = 0, supports_websockets = false }}",
+        server.uri()
+    );
+    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd = AssertCommand::new(bin);
+    cmd.timeout(Duration::from_secs(30));
+    cmd.arg("exec")
+        .arg("--skip-git-repo-check")
+        .arg("-c")
+        .arg(&provider_override)
+        .arg("-c")
+        .arg("model_provider=\"mock\"")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("hello?");
+    cmd.env("CODEX_HOME", home.path())
+        .env("OPENAI_API_KEY", "dummy");
+
+    let output = cmd.output().unwrap();
+    println!("Status: {}", output.status);
+    println!("Stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+    println!("Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hi_lines = stdout.lines().filter(|line| line.trim() == "hi").count();
+    assert_eq!(hi_lines, 1, "Expected exactly one line with 'hi'");
+
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected repeated request replay after transient stream disconnects"
+    );
+
+    server.shutdown().await;
 }
 
 /// Ensures `OPENAI_BASE_URL` still works as a deprecated fallback.
