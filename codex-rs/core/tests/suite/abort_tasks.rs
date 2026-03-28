@@ -7,6 +7,8 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_reasoning_item_added;
+use core_test_support::responses::ev_reasoning_summary_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
@@ -72,6 +74,7 @@ async fn interrupt_long_running_tool_emits_turn_aborted() {
 async fn interrupt_tool_records_history_entries() {
     let command = "sleep 60";
     let call_id = "call-history";
+    let reasoning_id = "reasoning-history";
 
     let args = json!({
         "command": command,
@@ -80,6 +83,8 @@ async fn interrupt_tool_records_history_entries() {
     .to_string();
     let first_body = sse(vec![
         ev_response_created("resp-history"),
+        ev_reasoning_item_added(reasoning_id, &[""]),
+        ev_reasoning_summary_text_delta("thinking"),
         ev_function_call(call_id, "shell_command", &args),
         ev_completed("resp-history"),
     ]);
@@ -136,6 +141,20 @@ async fn interrupt_tool_records_history_entries() {
         requests.len()
     );
 
+    let follow_up_request = &requests[1];
+    let follow_up_reasoning_items = follow_up_request.inputs_of_type("reasoning");
+    assert_eq!(
+        follow_up_reasoning_items.len(),
+        1,
+        "expected follow-up request to replay the interrupted reasoning item"
+    );
+    assert_eq!(
+        follow_up_reasoning_items[0]
+            .get("id")
+            .and_then(serde_json::Value::as_str),
+        Some(reasoning_id)
+    );
+
     assert!(
         response_mock.saw_function_call(call_id),
         "function call not recorded in responses payload"
@@ -161,6 +180,33 @@ async fn interrupt_tool_records_history_entries() {
     assert!(
         secs >= 0.1,
         "expected at least one tenth of a second of elapsed time, got {secs}"
+    );
+
+    let follow_up_input = follow_up_request.input();
+    let reasoning_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+                && item.get("id").and_then(serde_json::Value::as_str) == Some(reasoning_id)
+        })
+        .expect("missing reasoning item in follow-up request");
+    let function_call_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                && item.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+        })
+        .expect("missing function_call in follow-up request");
+    let function_output_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+        })
+        .expect("missing function_call_output in follow-up request");
+    assert!(
+        reasoning_index < function_call_index && function_call_index < function_output_index,
+        "expected reasoning -> function_call -> function_call_output ordering in follow-up replay"
     );
 }
 
