@@ -6,6 +6,8 @@ use codex_core::WireApi;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_utils_cargo_bin::find_resource;
+use core_test_support::load_sse_fixture;
 use core_test_support::responses;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_reasoning_item_added;
@@ -19,6 +21,12 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use serde_json::Value;
 use serde_json::json;
+
+fn sse_incomplete() -> String {
+    let fixture = find_resource!("tests/fixtures/incomplete_sse.json")
+        .unwrap_or_else(|err| panic!("failed to resolve incomplete_sse fixture: {err}"));
+    load_sse_fixture(fixture)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retries_on_early_close() {
