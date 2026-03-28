@@ -50,18 +50,25 @@ Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your 
 
 You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
-## Fork Enhancements
+## About This Fork
 
-This fork adds runtime model controls in the interactive CLI:
+`dzianisv/codex` is a maintained fork of `openai/codex`. It regularly pulls in upstream changes, but it intentionally carries a smaller set of fork-only patches focused on runtime model/provider control, reflection experiments, and keeping the fork's release/CI workflow usable.
 
-- Run `/model` to switch provider and model without restarting Codex.
-- After selecting the model, choose the reasoning effort to use for that runtime configuration.
-- Provider-backed model catalogs are supported, so the picker can surface models exposed by configured integrations.
+If you want the stock OpenAI project, use `openai/codex`. If you want the fork-specific behavior below, use this repository.
 
-This fork also includes an experimental reflection layer:
+### What This Fork Adds Compared to `openai/codex`
 
-- A judge model evaluates the completed turn, returns a verdict with confidence, and can trigger another attempt when the task is incomplete.
-- See [Reflection Layer](./docs/reflection.md) for configuration details, test coverage, and example output.
+- Runtime `/model` switching that applies provider, model, and reasoning-effort changes to the live session instead of forcing a fresh session before the change takes effect.
+- Provider-authoritative `/model` discovery, including `models.dev` catalog integration plus fork fixes for GitHub Copilot, Azure alias handling, and safer fallbacks when a provider's `/models` response is incomplete or partially unsupported.
+- Copilot-specific compatibility fixes around Claude-family fallback responses and tool-call wrapper normalization so tool activity is preserved as native Codex items instead of collapsing into plain text.
+- An experimental reflection layer, including active-session reload support for reflection config; see [Reflection Layer](./docs/reflection.md) for configuration details, examples, and test coverage.
+- Fork maintainer fixes around cached-source installs, npm staging, hosted-runner fallbacks, and other CI/release issues that affect this fork even when they are not part of upstream.
+
+### Maintenance Notes
+
+- Upstream `openai/codex` remains the source of truth for general Codex documentation and newly landed OpenAI-owned features.
+- This fork keeps its divergence intentionally narrow: features that land upstream should be removed from the fork-specific patch stack instead of being carried forever.
+- The fork is most useful if you need the runtime model-switching and provider-catalog work before upstream picks up equivalent behavior.
 
 ## Docs
 
