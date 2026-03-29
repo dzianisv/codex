@@ -32,6 +32,9 @@ cargo install --locked cargo-nextest
 # Install a local codex binary with reuse of previous build artifacts.
 ./install.sh
 
+# If your main volume is tight on space, keep Cargo build artifacts on another disk.
+CARGO_TARGET_DIR=/path/on/larger/disk/codex-target ./install.sh
+
 # Or build Codex manually from the Rust workspace.
 cd codex-rs
 cargo build
