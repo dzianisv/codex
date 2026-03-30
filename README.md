@@ -60,6 +60,7 @@ If you want the stock OpenAI project, use `openai/codex`. If you want the fork-s
 
 - Runtime `/model` switching that applies provider, model, and reasoning-effort changes to the live session instead of forcing a fresh session before the change takes effect.
 - Provider-authoritative `/model` discovery, including `models.dev` catalog integration plus fork fixes for GitHub Copilot, Azure alias handling, and safer fallbacks when a provider's `/models` response is incomplete or partially unsupported.
+- Interrupted-session recovery for Azure-hosted reasoning turns: follow-up prompts and `codex resume --last` now drop orphan replayed reasoning items after an interrupt, preventing `required following item` request failures from stranding the session.
 - Copilot-specific compatibility fixes around Claude-family fallback responses and tool-call wrapper normalization so tool activity is preserved as native Codex items instead of collapsing into plain text.
 - An experimental reflection layer, including active-session reload support for reflection config; see [Reflection Layer](./docs/reflection.md) for configuration details, examples, and test coverage.
 - Fork maintainer fixes around cached-source installs, npm staging, hosted-runner fallbacks, and other CI/release issues that affect this fork even when they are not part of upstream.

@@ -426,6 +426,68 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
 }
 
 #[test]
+fn for_prompt_drops_reasoning_without_following_model_item_in_the_same_turn() {
+    let history = create_history_with_items(vec![
+        user_input_text_msg("first prompt"),
+        reasoning_with_id("reason-first", "summary", Some("thinking")),
+        user_input_text_msg("second prompt"),
+        assistant_msg("second answer"),
+        user_input_text_msg("third prompt"),
+        reasoning_with_id("reason-third", "summary", Some("more thinking")),
+    ]);
+
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![
+            user_input_text_msg("first prompt"),
+            user_input_text_msg("second prompt"),
+            assistant_msg("second answer"),
+            user_input_text_msg("third prompt"),
+        ]
+    );
+}
+
+#[test]
+fn for_prompt_keeps_reasoning_when_a_model_item_follows_before_the_next_user_turn() {
+    let history = create_history_with_items(vec![
+        user_input_text_msg("first prompt"),
+        reasoning_with_id("reason-tool", "summary", Some("thinking")),
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "do_it".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call-1".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text("ok".to_string()),
+        },
+        user_input_text_msg("follow up"),
+    ]);
+
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![
+            user_input_text_msg("first prompt"),
+            reasoning_with_id("reason-tool", "summary", Some("thinking")),
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "do_it".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "call-1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_text("ok".to_string()),
+            },
+            user_input_text_msg("follow up"),
+        ]
+    );
+}
+
+#[test]
 fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     let history = create_history_with_items(vec![
         ResponseItem::ImageGenerationCall {

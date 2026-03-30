@@ -1,4 +1,5 @@
 // Aggregates all former standalone integration tests as modules.
+mod interrupt_reasoning_e2e;
 mod model_availability_nux;
 mod model_switching_e2e;
 mod no_panic_on_startup;

@@ -14,10 +14,13 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use regex_lite::Regex;
 use serde_json::json;
+use tokio::sync::oneshot;
 
 /// Integration test: spawn a long‑running shell_command tool via a mocked Responses SSE
 /// function call, then interrupt the session and expect TurnAborted.
@@ -208,6 +211,106 @@ async fn interrupt_tool_records_history_entries() {
         reasoning_index < function_call_index && function_call_index < function_output_index,
         "expected reasoning -> function_call -> function_call_output ordering in follow-up replay"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_drops_dangling_reasoning_from_follow_up_request() {
+    let reasoning_id = "reasoning-dangling";
+    let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
+
+    let first_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("resp-reasoning")]),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_reasoning_item_added(reasoning_id, &[""])]),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_reasoning_summary_text_delta("thinking")]),
+        },
+        StreamingSseChunk {
+            gate: Some(gate_completed_rx),
+            body: sse(vec![ev_completed("resp-reasoning")]),
+        },
+    ];
+    let second_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("resp-followup")]),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_completed("resp-followup")]),
+        },
+    ];
+
+    let (server, _) = start_streaming_sse_server(vec![first_chunks, second_chunks]).await;
+
+    let codex = test_codex()
+        .with_model("gpt-5.1")
+        .build_with_streaming_server(&server)
+        .await
+        .unwrap()
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start reasoning".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::ReasoningContentDelta(_))
+    })
+    .await;
+
+    codex.submit(Op::Interrupt).await.unwrap();
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
+    drop(gate_completed_tx);
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "follow up".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected interrupted turn plus one follow-up request"
+    );
+
+    let follow_up_request: serde_json::Value =
+        serde_json::from_slice(&requests[1]).expect("parse follow-up request");
+    let reasoning_items = follow_up_request["input"]
+        .as_array()
+        .expect("follow-up request input should be an array")
+        .iter()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .collect::<Vec<_>>();
+    assert!(
+        reasoning_items.is_empty(),
+        "expected follow-up request to drop dangling reasoning items, got {reasoning_items:?}"
+    );
+
+    server.shutdown().await;
 }
 
 /// After an interrupt we persist a model-visible `<turn_aborted>` marker in the conversation

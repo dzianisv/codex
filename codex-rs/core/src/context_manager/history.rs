@@ -349,7 +349,9 @@ impl ContextManager {
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
-    /// 3. when images are unsupported, image content is stripped from messages and tool outputs
+    /// 3. reasoning items only survive when a later model-generated non-reasoning item
+    ///    appears before the next real user turn boundary
+    /// 4. when images are unsupported, image content is stripped from messages and tool outputs
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         // all function/tool calls must have a corresponding output
         normalize::ensure_call_outputs_present(&mut self.items);
@@ -357,8 +359,41 @@ impl ContextManager {
         // all outputs must have a corresponding function/tool call
         normalize::remove_orphan_outputs(&mut self.items);
 
+        // The Responses API rejects dangling reasoning replay. Keep reasoning
+        // only when this turn already produced the assistant/tool item it
+        // belongs to.
+        self.remove_orphan_reasoning_items();
+
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
+    }
+
+    fn remove_orphan_reasoning_items(&mut self) {
+        let mut keep = vec![true; self.items.len()];
+        let mut has_reasoning_successor = false;
+
+        for (index, item) in self.items.iter().enumerate().rev() {
+            if is_user_turn_boundary(item) {
+                has_reasoning_successor = false;
+                continue;
+            }
+
+            if matches!(item, ResponseItem::Reasoning { .. }) {
+                keep[index] = has_reasoning_successor;
+                continue;
+            }
+
+            if is_model_generated_item(item) {
+                has_reasoning_successor = true;
+            }
+        }
+
+        let mut index = 0usize;
+        self.items.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
