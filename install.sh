@@ -18,6 +18,7 @@ Environment knobs:
   CODEX_SOURCE_BIN          Prebuilt binary path to install (skips build unless CODEX_REBUILD=always)
   CODEX_INSTALL_LOCK_DIR    Lock dir to prevent concurrent installers
   CARGO_TARGET_DIR          Build cache/output directory (default: codex-rs/target)
+                           Set this to a path on another disk when local space is tight.
 EOF
 }
 
@@ -67,6 +68,23 @@ case "$target_dir" in
         ;;
 esac
 build_stamp_file="$target_dir/release/.codex-install-build-stamp"
+
+existing_dir_for_path() {
+    path=$1
+    while [ ! -e "$path" ]; do
+        parent=$(dirname -- "$path")
+        if [ "$parent" = "$path" ]; then
+            break
+        fi
+        path=$parent
+    done
+
+    if [ -d "$path" ]; then
+        printf '%s\n' "$path"
+    else
+        dirname -- "$path"
+    fi
+}
 
 collect_source_files() {
     find "$ROOT_DIR/codex-rs" \
@@ -271,16 +289,21 @@ fi
 
 if [ "$should_build" -eq 1 ]; then
     required_kb=${CODEX_MIN_FREE_KB:-3145728}
-    available_kb=$(df -Pk "$ROOT_DIR" | awk 'NR==2 {print $4}')
+    space_check_dir=$(existing_dir_for_path "$target_dir")
+    available_kb=$(df -Pk "$space_check_dir" | awk 'NR==2 {print $4}')
     if [ "$available_kb" -lt "$required_kb" ]; then
-        echo "Low free disk space detected (${available_kb} KB). Running cargo clean..." >&2
-        cargo clean --manifest-path "$ROOT_DIR/codex-rs/Cargo.toml" >/dev/null 2>&1 || true
-        available_kb=$(df -Pk "$ROOT_DIR" | awk 'NR==2 {print $4}')
+        echo "Low free disk space detected for build target (${available_kb} KB at $space_check_dir)." >&2
+        echo "Running cargo clean for CARGO_TARGET_DIR=$target_dir..." >&2
+        CARGO_TARGET_DIR="$target_dir" cargo clean --manifest-path "$ROOT_DIR/codex-rs/Cargo.toml" >/dev/null 2>&1 || true
+        available_kb=$(df -Pk "$space_check_dir" | awk 'NR==2 {print $4}')
     fi
     if [ "$available_kb" -lt "$required_kb" ]; then
         echo "error: not enough free disk space to build codex release" >&2
         echo "available: ${available_kb} KB, required: ${required_kb} KB" >&2
-        echo "free space and retry (or lower threshold with CODEX_MIN_FREE_KB)." >&2
+        echo "target dir: $target_dir" >&2
+        echo "free space and retry, or point CARGO_TARGET_DIR at a larger disk, for example:" >&2
+        echo "  CARGO_TARGET_DIR=/path/on/larger/disk/codex-target ./install.sh" >&2
+        echo "You can also lower the threshold with CODEX_MIN_FREE_KB." >&2
         exit 1
     fi
 
@@ -297,9 +320,9 @@ if [ "$should_build" -eq 1 ]; then
     fi
 
     if [ -n "$build_reason" ]; then
-        echo "Building codex release binary (mode=$build_mode jobs=$build_jobs incremental=$resolved_build_incremental reason=$build_reason)..."
+        echo "Building codex release binary (mode=$build_mode jobs=$build_jobs incremental=$resolved_build_incremental target=$target_dir reason=$build_reason)..."
     else
-        echo "Building codex release binary (mode=$build_mode jobs=$build_jobs incremental=$resolved_build_incremental)..."
+        echo "Building codex release binary (mode=$build_mode jobs=$build_jobs incremental=$resolved_build_incremental target=$target_dir)..."
     fi
     if [ -n "$profile_overrides" ]; then
         env $profile_overrides CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_INCREMENTAL="$resolved_build_incremental" \
